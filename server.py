@@ -287,6 +287,7 @@ class CourierCreateReq(BaseModel):
     phone: str
     first_name: str
     zone: str = "Toshkent"
+    is_admin_courier: bool = False
 
 
 class BlockReq(BaseModel):
@@ -1832,9 +1833,25 @@ async def seller_stats(user=Depends(get_seller)):
 
 
 # ---------- Courier ----------
+def is_admin_courier(user: dict) -> bool:
+    """True if this account is the single hub/admin courier."""
+    if not user:
+        return False
+    if user.get("role") == "admin_courier":
+        return True
+    ci = user.get("courier_info") or {}
+    return bool(ci.get("is_admin_courier"))
+
+
 async def get_courier(user=Depends(get_user)):
-    if user["role"] != "courier":
+    if user["role"] not in ("courier", "admin_courier"):
         raise HTTPException(403, "Faqat kuryerlar uchun")
+    return user
+
+
+async def get_admin_courier(user=Depends(get_courier)):
+    if not is_admin_courier(user):
+        raise HTTPException(403, "Faqat admin kuryer uchun")
     return user
 
 
@@ -1888,7 +1905,17 @@ async def courier_toggle(req: ToggleReq, user=Depends(get_courier)):
 
 @api_router.get("/courier/available")
 async def courier_available(user=Depends(get_courier)):
-    orders = await db.orders.find({"status": "packing", "courier_id": None, "delivery_method": "courier"}, {"_id": 0}).sort("created_at", 1).to_list(50)
+    """Admin kuryer: hali hubda tekshirilmagan packing buyurtmalar.
+    Oddiy kuryer: admin kuryer chek chiqargan (hub-check) buyurtmalar.
+    """
+    base = {"status": "packing", "courier_id": None, "delivery_method": "courier"}
+    if is_admin_courier(user):
+        # Yangi yoki hali hub-check bo'lmaganlar
+        q = {**base, "admin_courier_checked_at": {"$exists": False}}
+    else:
+        # Faqat hubdan o'tganlar
+        q = {**base, "admin_courier_checked_at": {"$ne": None}}
+    orders = await db.orders.find(q, {"_id": 0}).sort("created_at", 1).to_list(50)
     return [await order_with_route(o) for o in orders]
 
 
@@ -1900,13 +1927,89 @@ async def courier_my(user=Depends(get_courier)):
 
 @api_router.post("/courier/orders/{oid}/accept")
 async def courier_accept(oid: str, user=Depends(get_courier)):
+    """Oddiy kuryer qabul qiladi — faqat admin kuryer hub-check qilgan buyurtma.
+    Admin kuryer bu endpoint orqali o'zi yetkazishga olmaydi; /hub-check ishlatadi.
+    """
+    if is_admin_courier(user):
+        raise HTTPException(400, "Admin kuryer yetkazishga olmaydi. Avval chek chiqaring (hub-check)")
     o = await db.orders.find_one({"id": oid, "status": "packing", "courier_id": None})
     if not o:
         raise HTTPException(400, "Buyurtma band yoki mavjud emas")
+    if not o.get("admin_courier_checked_at"):
+        raise HTTPException(400, "Buyurtma hali admin kuryer tomonidan tekshirilmagan")
     await db.orders.update_one({"id": oid}, {"$set": {"courier_id": user["id"]}})
     o["courier_id"] = user["id"]
     await set_order_status(o, "courier")
     return {"ok": True}
+
+
+@api_router.post("/courier/orders/{oid}/hub-check")
+async def courier_hub_check(oid: str, user=Depends(get_admin_courier)):
+    """Admin kuryer: buyurtmani qabul qiladi, chek chiqarishga tayyorlaydi va
+    oddiy kuryerlar ro'yxatiga chiqaradi. Status packing qoladi, courier_id bo'sh.
+    """
+    o = await db.orders.find_one({"id": oid, "status": "packing", "courier_id": None}, {"_id": 0})
+    if not o:
+        raise HTTPException(400, "Buyurtma band yoki mavjud emas")
+    if o.get("admin_courier_checked_at"):
+        raise HTTPException(400, "Bu buyurtma allaqachon hubdan o'tgan")
+    checked_at = iso()
+    await db.orders.update_one(
+        {"id": oid},
+        {
+            "$set": {
+                "admin_courier_id": user["id"],
+                "admin_courier_checked_at": checked_at,
+                "admin_courier_name": user.get("first_name") or "Admin kuryer",
+            },
+            "$push": {
+                "status_history": {
+                    "status": "packing",
+                    "at": checked_at,
+                    "note": "Admin kuryer chek chiqardi / hub-check",
+                }
+            },
+        },
+    )
+    # Oddiy onlayn kuryerlarga xabar
+    online_couriers = await db.users.find(
+        {"role": "courier", "courier_info.online": True},
+        {"_id": 0, "id": 1},
+    ).to_list(100)
+    for c in online_couriers:
+        if c.get("id") == user["id"]:
+            continue
+        await notify(c["id"], "Yangi buyurtma tayyor", f"{o.get('number', oid)} — hubdan chiqdi, qabul qilishingiz mumkin")
+    await notify(o["client_id"], f"Buyurtma {o.get('number', '')}", "Buyurtma ombordan chiqarildi, kuryer tayinlanmoqda")
+    return {"ok": True, "checked_at": checked_at, "order_id": oid}
+
+
+@api_router.get("/courier/hub-queue")
+async def courier_hub_queue(user=Depends(get_admin_courier)):
+    """Admin kuryer uchun: kutayotgan + allaqachon tekshirilgan (hali olinmagan) ro'yxat."""
+    waiting = await db.orders.find(
+        {"status": "packing", "courier_id": None, "delivery_method": "courier", "admin_courier_checked_at": {"$exists": False}},
+        {"_id": 0},
+    ).sort("created_at", 1).to_list(100)
+    released = await db.orders.find(
+        {"status": "packing", "courier_id": None, "delivery_method": "courier", "admin_courier_checked_at": {"$ne": None}},
+        {"_id": 0},
+    ).sort("admin_courier_checked_at", -1).to_list(50)
+    return {
+        "waiting": [await order_with_route(o) for o in waiting],
+        "released": [await order_with_route(o) for o in released],
+        "is_admin_courier": True,
+    }
+
+
+@api_router.get("/courier/me-flags")
+async def courier_me_flags(user=Depends(get_courier)):
+    return {
+        "is_admin_courier": is_admin_courier(user),
+        "role": user.get("role"),
+        "online": bool((user.get("courier_info") or {}).get("online")),
+        "zone": (user.get("courier_info") or {}).get("zone"),
+    }
 
 
 @api_router.post("/courier/orders/{oid}/cancel")
@@ -1965,99 +2068,179 @@ async def courier_stats(user=Depends(get_courier)):
 
 @api_router.get("/admin/map-locations")
 async def admin_map_locations(user=Depends(get_admin)):
-    """Markers for clients, sellers, couriers — different colors on the map."""
+    """Xarita markerlari:
+    - Sotuvchi: yashil
+    - Kuryer: sariq
+    - Yangi mijoz (1 oy ichida buyurtma yo'q): ko'k
+    - 1 oy ichida buyurtma bergan mijoz: qizil
+    - Oxirgi 7 kun ichidagi buyurtma nuqtalari: pushti
+    """
     try:
+        now_dt = now()
+        month_ago = iso(now_dt - timedelta(days=30))
+        week_ago = iso(now_dt - timedelta(days=7))
+
         users = await (
             db.users.find(
                 {},
                 {"_id": 0, "id": 1, "role": 1, "first_name": 1, "last_name": 1, "phone": 1,
-                 "addresses": 1, "location": 1, "seller_info": 1, "courier_info": 1},
+                 "addresses": 1, "location": 1, "saved_location": 1, "seller_info": 1, "courier_info": 1,
+                 "created_at": 1},
             )
             .max_time_ms(12000)
-            .to_list(500)
+            .to_list(800)
         )
+
+        # Oxirgi 30 kun buyurtmalar — mijoz faolligi + yetkazish nuqtalari
+        recent_orders = await (
+            db.orders.find(
+                {"created_at": {"$gte": month_ago}},
+                {"_id": 0, "id": 1, "number": 1, "client_id": 1, "created_at": 1, "status": 1,
+                 "address_lat": 1, "address_lng": 1, "delivery_location": 1, "address_text": 1,
+                 "client_name": 1, "client_phone": 1},
+            )
+            .max_time_ms(12000)
+            .to_list(2000)
+        )
+
+        # client_id -> eng so'nggi buyurtma vaqti
+        last_order_at: Dict[str, str] = {}
+        for o in recent_orders:
+            cid = o.get("client_id")
+            if not cid:
+                continue
+            at = o.get("created_at") or ""
+            if cid not in last_order_at or at > last_order_at[cid]:
+                last_order_at[cid] = at
+
         markers = []
+
+        def add_client_point(mid: str, lat, lng, title: str, subtitle: str, color: str, role_label: str, mtype: str):
+            try:
+                markers.append({
+                    "id": mid,
+                    "type": mtype,
+                    "color": color,
+                    "lat": float(lat),
+                    "lng": float(lng),
+                    "title": title,
+                    "subtitle": subtitle,
+                    "role_label": role_label,
+                })
+            except (TypeError, ValueError):
+                pass
+
         for u in users:
             name = f"{u.get('first_name') or ''} {u.get('last_name') or ''}".strip() or "—"
             phone = u.get("phone") or ""
             uid = u.get("id")
-
-            # Seller shop location
             si = u.get("seller_info") or {}
-            if si.get("shop_lat") is not None and si.get("shop_lng") is not None:
-                markers.append({
-                    "id": f"seller-{uid}",
-                    "type": "seller",
-                    "color": "#16a34a",  # green
-                    "lat": float(si["shop_lat"]),
-                    "lng": float(si["shop_lng"]),
-                    "title": si.get("shop_name") or name,
-                    "subtitle": phone,
-                    "role_label": "Sotuvchi",
-                })
-
-            # Courier live / last location
             ci = u.get("courier_info") or {}
-            if u.get("role") == "courier":
-                clat = ci.get("lat") if ci.get("lat") is not None else None
-                clng = ci.get("lng") if ci.get("lng") is not None else None
+            role = u.get("role") or "client"
+
+            # ——— Sotuvchi: yashil ———
+            if si.get("shop_lat") is not None and si.get("shop_lng") is not None:
+                add_client_point(
+                    f"seller-{uid}", si["shop_lat"], si["shop_lng"],
+                    si.get("shop_name") or name, phone, "#16a34a", "Sotuvchi", "seller",
+                )
+            elif si.get("approved"):
+                for a in (u.get("addresses") or []):
+                    if a.get("lat") is not None and a.get("lng") is not None:
+                        add_client_point(
+                            f"seller-{uid}-addr", a["lat"], a["lng"],
+                            si.get("shop_name") or name, a.get("text") or phone,
+                            "#16a34a", "Sotuvchi", "seller",
+                        )
+                        break
+
+            # ——— Kuryer: sariq ———
+            if role in ("courier", "admin_courier") or ci:
+                clat = ci.get("lat")
+                clng = ci.get("lng")
+                # saved_location fallback
+                sl = u.get("saved_location") or {}
+                if clat is None and sl.get("lat") is not None:
+                    clat, clng = sl.get("lat"), sl.get("lng")
                 if clat is None:
-                    # fallback to first address
                     for a in (u.get("addresses") or []):
                         if a.get("lat") is not None and a.get("lng") is not None:
                             clat, clng = a["lat"], a["lng"]
                             break
                 if clat is not None and clng is not None:
-                    markers.append({
-                        "id": f"courier-{uid}",
-                        "type": "courier",
-                        "color": "#2563eb",  # blue
-                        "lat": float(clat),
-                        "lng": float(clng),
-                        "title": name,
-                        "subtitle": phone,
-                        "role_label": "Kuryer",
-                        "online": bool(ci.get("online")),
-                    })
+                    zone = ci.get("zone") or ""
+                    online = "● Onlayn" if ci.get("online") else "○ Oflayn"
+                    add_client_point(
+                        f"courier-{uid}", clat, clng, name,
+                        f"{phone} • {zone} • {online}".strip(" •"),
+                        "#EAB308", "Kuryer", "courier",
+                    )
 
-            # Clients — addresses + optional location
-            if u.get("role") == "client" and not si.get("approved"):
-                added = False
-                loc = u.get("location") or {}
+            # ——— Mijoz: qizil (1 oy ichida buyurtma) / ko'k (yangi) ———
+            is_seller_only = bool(si.get("approved")) and role == "client"
+            if role == "client" and not is_seller_only:
+                last_at = last_order_at.get(uid or "")
+                if last_at and last_at >= month_ago:
+                    color = "#DC2626"  # qizil — 1 oy ichida zakaz
+                    mtype = "client_month"
+                    role_label = "Mijoz (1 oy ichida)"
+                else:
+                    color = "#2563EB"  # ko'k — yangi / faol emas
+                    mtype = "client_new"
+                    role_label = "Yangi mijoz"
+
+                points = []
+                loc = u.get("saved_location") or u.get("location") or {}
                 if loc.get("lat") is not None and loc.get("lng") is not None:
-                    markers.append({
-                        "id": f"client-{uid}-loc",
-                        "type": "client",
-                        "color": "#ea580c",  # orange
-                        "lat": float(loc["lat"]),
-                        "lng": float(loc["lng"]),
-                        "title": name,
-                        "subtitle": phone,
-                        "role_label": "Mijoz",
-                    })
-                    added = True
+                    points.append(("loc", loc["lat"], loc["lng"], phone))
                 for i, a in enumerate(u.get("addresses") or []):
                     if a.get("lat") is not None and a.get("lng") is not None:
-                        markers.append({
-                            "id": f"client-{uid}-a{i}",
-                            "type": "client",
-                            "color": "#ea580c",
-                            "lat": float(a["lat"]),
-                            "lng": float(a["lng"]),
-                            "title": name,
-                            "subtitle": a.get("label") or a.get("text") or phone,
-                            "role_label": "Mijoz",
-                        })
-                        added = True
+                        points.append((f"a{i}", a["lat"], a["lng"], a.get("label") or a.get("text") or phone))
+                # dublikatsiz birinchi nuqta yetarli, lekin barcha manzillarni ko'rsatamiz
+                seen = set()
+                for key, lat, lng, sub in points:
+                    sk = (round(float(lat), 5), round(float(lng), 5))
+                    if sk in seen:
+                        continue
+                    seen.add(sk)
+                    add_client_point(f"client-{uid}-{key}", lat, lng, name, sub, color, role_label, mtype)
 
-        return json_safe({"markers": markers, "counts": {
-            "client": sum(1 for m in markers if m["type"] == "client"),
+        # ——— Oxirgi 7 kun buyurtma yetkazish nuqtalari: pushti ———
+        for o in recent_orders:
+            if (o.get("created_at") or "") < week_ago:
+                continue
+            lat = o.get("address_lat")
+            lng = o.get("address_lng")
+            dl = o.get("delivery_location") or {}
+            if lat is None:
+                lat = dl.get("lat")
+            if lng is None:
+                lng = dl.get("lng")
+            if lat is None or lng is None:
+                continue
+            add_client_point(
+                f"order-week-{o.get('id')}",
+                lat, lng,
+                o.get("number") or "Buyurtma",
+                f"{o.get('client_name') or ''} • {o.get('address_text') or o.get('client_phone') or ''}".strip(" •"),
+                "#EC4899",  # pushti
+                "Buyurtma (7 kun)",
+                "order_week",
+            )
+
+        counts = {
+            "client_month": sum(1 for m in markers if m["type"] == "client_month"),
+            "client_new": sum(1 for m in markers if m["type"] == "client_new"),
+            "client": sum(1 for m in markers if m["type"] in ("client_month", "client_new", "client")),
             "seller": sum(1 for m in markers if m["type"] == "seller"),
             "courier": sum(1 for m in markers if m["type"] == "courier"),
-        }})
+            "order_week": sum(1 for m in markers if m["type"] == "order_week"),
+        }
+        return json_safe({"markers": markers, "counts": counts})
     except Exception as e:
         logger.exception("admin_map_locations failed: %s", e)
-        return {"markers": [], "counts": {"client": 0, "seller": 0, "courier": 0}}
+        return {"markers": [], "counts": {"client": 0, "client_month": 0, "client_new": 0, "seller": 0, "courier": 0, "order_week": 0}}
+
 
 
 @api_router.get("/admin/dashboard")
@@ -2850,9 +3033,27 @@ async def admin_add_courier(req: CourierCreateReq, user=Depends(get_admin)):
     phone = re.sub(r"[^\d+]", "", req.phone)
     if await db.users.find_one({"phone": phone}):
         raise HTTPException(400, "Bu raqam ro'yxatda bor")
-    c = {"id": uid(), "phone": phone, "first_name": req.first_name, "last_name": "", "role": "courier",
-         "language": "uz", "blocked": False, "referral_code": f"UZ{random.randint(10000, 99999)}",
-         "favorites": [], "addresses": [], "courier_info": {"online": False, "zone": req.zone, "earnings": 0, "deliveries": 0, "stats_reset_at": None}, "created_at": iso()}
+    # Admin kuryer tizimda faqat bitta bo'lishi kerak
+    if req.is_admin_courier:
+        existing_ac = await db.users.find_one({
+            "$or": [
+                {"role": "admin_courier"},
+                {"courier_info.is_admin_courier": True},
+            ]
+        })
+        if existing_ac:
+            raise HTTPException(400, "Admin kuryer allaqachon mavjud. Faqat bitta admin kuryer bo'lishi mumkin")
+    role = "admin_courier" if req.is_admin_courier else "courier"
+    c = {
+        "id": uid(), "phone": phone, "first_name": req.first_name, "last_name": "", "role": role,
+        "language": "uz", "blocked": False, "referral_code": f"UZ{random.randint(10000, 99999)}",
+        "favorites": [], "addresses": [],
+        "courier_info": {
+            "online": False, "zone": req.zone, "earnings": 0, "deliveries": 0,
+            "stats_reset_at": None, "is_admin_courier": bool(req.is_admin_courier),
+        },
+        "created_at": iso(),
+    }
     await db.users.insert_one(dict(c))
     return {k: v for k, v in c.items() if k != "_id"}
 
@@ -3010,6 +3211,52 @@ async def start_reminder_worker():
 
 
 @app.on_event("startup")
+async def ensure_admin_courier_account():
+    """Mavjud DB da ham yagona admin kuryer bo'lishini kafolatlaydi."""
+    try:
+        existing = await db.users.find_one({
+            "$or": [
+                {"role": "admin_courier"},
+                {"courier_info.is_admin_courier": True},
+            ]
+        })
+        if existing:
+            # role va flag sinxron
+            await db.users.update_one(
+                {"id": existing["id"]},
+                {"$set": {"role": "admin_courier", "courier_info.is_admin_courier": True}},
+            )
+            return
+        phone = "+998906666666"
+        if await db.users.find_one({"phone": phone}):
+            await db.users.update_one(
+                {"phone": phone},
+                {"$set": {
+                    "role": "admin_courier",
+                    "courier_info.is_admin_courier": True,
+                    "courier_info.zone": "Toshkent",
+                }},
+            )
+            logger.info("Existing user %s promoted to admin_courier", phone)
+            return
+        u = {
+            "id": uid(), "phone": phone, "first_name": "Admin", "last_name": "Kuryer",
+            "role": "admin_courier", "language": "uz", "blocked": False,
+            "referral_code": f"UZ{random.randint(10000, 99999)}",
+            "favorites": [], "addresses": [],
+            "courier_info": {
+                "online": True, "zone": "Toshkent", "earnings": 0, "deliveries": 0,
+                "stats_reset_at": None, "is_admin_courier": True,
+            },
+            "created_at": iso(),
+        }
+        await db.users.insert_one(dict(u))
+        logger.info("Admin courier account created: %s", phone)
+    except Exception as e:
+        logger.warning("ensure_admin_courier_account: %s", e)
+
+
+@app.on_event("startup")
 async def seed():
     if await db.users.find_one({"phone": "+998900000000"}):
         return
@@ -3028,9 +3275,26 @@ async def seed():
     seller1 = mkuser("+998901111111", "Aziz", "Karimov", "client", {"seller_info": {"shop_name": "TechnoPlaza", "approved": True, "rejected": False, "commission": 10, "balance": 1250000, "rating": 4.8, "applied_at": iso()}})
     seller2 = mkuser("+998904444444", "Malika", "Yusupova", "client", {"seller_info": {"shop_name": "Fashion House", "approved": True, "rejected": False, "commission": 12, "balance": 830000, "rating": 4.6, "applied_at": iso()}})
     seller3 = mkuser("+998905555555", "Bobur", "Aliyev", "client", {"seller_info": {"shop_name": "Organic Market", "approved": False, "rejected": False, "commission": None, "balance": 0, "rating": 5.0, "applied_at": iso()}})
-    courier = mkuser("+998902222222", "Jasur", "Toshmatov", "courier", {"courier_info": {"online": True, "zone": "Chilonzor", "earnings": 345000, "deliveries": 23, "stats_reset_at": None}})
+    courier = mkuser("+998902222222", "Jasur", "Toshmatov", "courier", {"courier_info": {"online": True, "zone": "Chilonzor", "earnings": 345000, "deliveries": 23, "stats_reset_at": None, "is_admin_courier": False}})
+    # Yagona admin kuryer — telefon: +998906666666 (OTP orqali kiradi)
+    admin_courier = mkuser(
+        "+998906666666",
+        "Admin",
+        "Kuryer",
+        "admin_courier",
+        {
+            "courier_info": {
+                "online": True,
+                "zone": "Toshkent",
+                "earnings": 0,
+                "deliveries": 0,
+                "stats_reset_at": None,
+                "is_admin_courier": True,
+            }
+        },
+    )
     client_u = mkuser("+998903333333", "Dilnoza", "Rahimova", "client")
-    for u in (admin, seller1, seller2, seller3, courier, client_u):
+    for u in (admin, seller1, seller2, seller3, courier, admin_courier, client_u):
         await db.users.insert_one(dict(u))
 
     cats_def = [
