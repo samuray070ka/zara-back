@@ -1,10 +1,12 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Header, Query
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Header, Query, File, UploadFile
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import re
+import io
+import math
 import random
 import logging
 import difflib
@@ -133,6 +135,7 @@ class VerifyOtpReq(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     language: Optional[str] = "uz"
+    address_text: Optional[str] = None  # ixtiyoriy taxminiy manzil
 
 
 class ProfileReq(BaseModel):
@@ -220,9 +223,16 @@ class ProductReq(BaseModel):
     variations: List[Dict[str, Any]] = []
 
 
+class ItemDecisionReq(BaseModel):
+    index: int
+    action: str  # accept | reject
+
+
 class ActionReq(BaseModel):
     action: str
     reason: Optional[str] = ""
+    # partial accept: har bir mahsulot bo'yicha qaror
+    items: Optional[List[ItemDecisionReq]] = None
 
 
 class StatusReq(BaseModel):
@@ -281,6 +291,7 @@ class SettingsReq(BaseModel):
     work_hours: Optional[str] = None
     contact: Optional[str] = None
     default_markup_percent: Optional[float] = None
+    default_delivery_eta_days: Optional[int] = None
 
 
 class CourierCreateReq(BaseModel):
@@ -419,12 +430,22 @@ async def verify_otp(req: VerifyOtpReq):
     user = await db.users.find_one({"phone": phone})
     is_new = user is None
     if is_new:
+        addresses = []
+        addr_text = (req.address_text or "").strip() if getattr(req, "address_text", None) else ""
+        if addr_text:
+            addresses.append({
+                "id": uid(),
+                "label": "Asosiy",
+                "text": addr_text,
+                "lat": None,
+                "lng": None,
+            })
         user = {
             "id": uid(), "phone": phone,
             "first_name": req.first_name or "Foydalanuvchi", "last_name": req.last_name or "",
             "role": "client", "language": req.language or "uz", "blocked": False,
             "referral_code": f"UZ{random.randint(10000, 99999)}",
-            "favorites": [], "addresses": [], "created_at": iso(),
+            "favorites": [], "addresses": addresses, "created_at": iso(),
         }
         await db.users.insert_one(dict(user))
     if user.get("blocked"):
@@ -525,6 +546,10 @@ async def banners():
 
 SETTINGS_CACHE: Dict[str, Any] = {"default_markup_percent": 0}
 
+# Home / katalog list uchun qisqa TTL cache
+_PRODUCTS_LIST_CACHE: Dict[str, Any] = {"data": {}, "expires": {}}
+_PRODUCTS_LIST_TTL = 25.0
+
 
 def product_out(p):
     """Safe product serializer — never raises on missing/bad fields."""
@@ -595,7 +620,15 @@ def product_out(p):
                 seller_effective_box_price = base_box
                 effective_box_price = round(base_box * (1 + markup / 100)) if markup else base_box
 
-        sale_mode = "box" if units_per_box > 0 else "piece"
+        unit_type = str(p.get("unit_type") or "piece").lower().strip()
+        if unit_type not in ("piece", "kg"):
+            unit_type = "piece"
+        if unit_type == "kg":
+            sale_mode = "kg"
+        elif units_per_box > 0:
+            sale_mode = "box"
+        else:
+            sale_mode = "piece"
         display_price = effective_box_price if sale_mode == "box" and effective_box_price is not None else effective_price
         display_old_price = None
         if sale_mode == "box" and effective_old_price is not None:
@@ -607,11 +640,19 @@ def product_out(p):
             stock_total_units = int(p.get("stock", 0) or 0)
         except (TypeError, ValueError):
             stock_total_units = 0
+        # Ombor har doim dona/kg (stock maydoni) da saqlanadi.
+        # Quti faqat ko'rsatish uchun: to'liq quti soni + qolgan dona.
         display_stock = stock_total_units
-        display_stock_label = "dona"
-        if sale_mode == "box" and units_per_box > 0:
-            display_stock = stock_total_units // units_per_box
-            display_stock_label = "quti"
+        boxes_available = 0
+        if sale_mode == "kg":
+            display_stock_label = "kg"
+        elif units_per_box > 0:
+            boxes_available = stock_total_units // units_per_box
+            display_stock_label = "dona"
+            # UI uchun quti sonini ham beramiz (lekin tugaganlik donaga bog'liq)
+            display_stock = stock_total_units  # dona bo'yicha
+        else:
+            display_stock_label = "dona"
 
         # ensure images is always a list of strings
         images = p.get("images")
@@ -634,14 +675,17 @@ def product_out(p):
         p["display_old_price"] = display_old_price
         p["piece_price"] = effective_price
         p["sale_mode"] = sale_mode
+        p["unit_type"] = unit_type
         p["sale_units"] = units_per_box if sale_mode == "box" and units_per_box > 0 else 1
         p["units_per_box"] = units_per_box
-        p["stock_unit"] = "dona"
+        p["stock_unit"] = "kg" if unit_type == "kg" else "dona"
         p["stock_total_units"] = stock_total_units
         p["display_stock"] = display_stock
         p["display_stock_label"] = display_stock_label
+        p["boxes_available"] = boxes_available if units_per_box > 0 else 0
         p["markup_percent"] = markup
-        p["out_of_stock"] = display_stock <= 0
+        # Tugagan = dona/kg qolmaganda (quti bo'yicha emas!)
+        p["out_of_stock"] = stock_total_units <= 0
         p.setdefault("status", "pending")
         p.setdefault("hidden", False)
         p.setdefault("pinned", False)
@@ -667,24 +711,101 @@ def product_out(p):
 PRODUCT_FILTER = {"status": "approved", "hidden": {"$ne": True}}
 
 
+def _list_thumb(img_str: str, max_side: int = 240, quality: int = 55) -> str:
+    """List/card uchun kichik JPEG thumbnail. Xato bo'lsa original yoki bo'sh."""
+    try:
+        if not img_str or not isinstance(img_str, str):
+            return ""
+        s = img_str.strip()
+        if not s:
+            return ""
+        if s.startswith("http://") or s.startswith("https://"):
+            return s
+        if s.startswith("data:") and len(s) < 12_000:
+            return s
+        if not s.startswith("data:"):
+            return s if len(s) < 12_000 else ""
+        import base64 as _b64
+        import io as _io
+        from PIL import Image as _PILImage
+        parts = s.split(",", 1)
+        b64part = parts[1] if len(parts) == 2 else s
+        try:
+            raw = _b64.b64decode(b64part)
+        except Exception:
+            return ""
+        im = _PILImage.open(_io.BytesIO(raw))
+        if im.mode != "RGB":
+            im = im.convert("RGB")
+        # Pillow 9 vs 10 compatibility
+        try:
+            resample = _PILImage.Resampling.LANCZOS
+        except AttributeError:
+            resample = getattr(_PILImage, "LANCZOS", _PILImage.BICUBIC)
+        im.thumbnail((max_side, max_side), resample)
+        buf = _io.BytesIO()
+        im.save(buf, format="JPEG", quality=quality, optimize=True)
+        out_b64 = _b64.b64encode(buf.getvalue()).decode("ascii")
+        return "data:image/jpeg;base64," + out_b64
+    except Exception:
+        try:
+            return s if len(s) < 40_000 else ""
+        except Exception:
+            return ""
+
+
 def product_list_out(p):
-    """Lightweight product for list/admin grids — strips huge base64 payloads."""
-    out = product_out(p)
-    imgs = out.get("images") or []
-    slim = []
-    for im in imgs[:3]:
-        s = str(im) if im is not None else ""
-        # keep URLs; drop multi-KB base64 blobs from list responses
-        if s.startswith("data:") and len(s) > 500:
-            slim.append("")  # placeholder — full image on detail page
-        else:
-            slim.append(s)
-    out["images"] = slim
-    # drop heavy fields not needed in lists
-    out.pop("desc", None)
-    out.pop("variations", None)
-    out.pop("search_text", None)
-    return json_safe(out)
+    """Lightweight product for list/admin grids. Hech qachon raise qilmasin."""
+    try:
+        out = product_out(p)
+        if not isinstance(out, dict):
+            out = {}
+        imgs = out.get("images") or []
+        raw_first = ""
+        for im in imgs[:3]:
+            try:
+                s = str(im) if im is not None else ""
+            except Exception:
+                s = ""
+            if s and len(s.strip()) >= 8:
+                raw_first = s.strip()
+                break
+        if not raw_first and isinstance(p, dict):
+            for k in ("image", "preview_image", "main_image", "thumbnail", "photo"):
+                v = p.get(k)
+                if isinstance(v, str) and len(v.strip()) > 8:
+                    raw_first = v.strip()
+                    break
+        thumb = _list_thumb(raw_first) if raw_first else ""
+        out["images"] = [thumb] if thumb else []
+        out["image"] = thumb
+        out["preview_image"] = thumb
+        out.pop("desc", None)
+        out.pop("variations", None)
+        out.pop("search_text", None)
+        out.pop("attributes", None)
+        out.pop("specs", None)
+        return json_safe(out)
+    except Exception as e:
+        logger.exception("product_list_out failed: %s", e)
+        try:
+            pid = (p or {}).get("id") if isinstance(p, dict) else None
+        except Exception:
+            pid = None
+        return {
+            "id": pid,
+            "name": {"uz": "Mahsulot", "ru": "", "en": ""},
+            "images": [],
+            "image": "",
+            "preview_image": "",
+            "price": 0,
+            "effective_price": 0,
+            "display_price": 0,
+            "piece_price": 0,
+            "out_of_stock": True,
+        }
+
+
 
 
 
@@ -696,6 +817,17 @@ async def list_products(
     min_rating: Optional[float] = None, in_stock: Optional[bool] = None,
     sort: Optional[str] = "mix", skip: int = 0, limit: int = Query(20, le=50),
 ):
+    cache_key = None
+    try:
+        if not search and not seller_id and min_price is None and max_price is None and not discount and min_rating is None and not in_stock:
+            cache_key = f"{category_id or ''}|{sort}|{skip}|{limit}"
+            now_ts = time.time()
+            exp = _PRODUCTS_LIST_CACHE["expires"].get(cache_key, 0)
+            if now_ts < exp and cache_key in _PRODUCTS_LIST_CACHE["data"]:
+                return _PRODUCTS_LIST_CACHE["data"][cache_key]
+    except Exception:
+        cache_key = None
+
     q: Dict[str, Any] = dict(PRODUCT_FILTER)
     if category_id:
         q["$or"] = [{"category_id": category_id}, {"subcategory_id": category_id}]
@@ -720,7 +852,7 @@ async def list_products(
                 "popular": [("sold", -1)], "rating": [("rating", -1)], "mix": [("pinned", -1), ("sold", -1)]}
     cursor = db.products.find(q).sort(sort_map.get(sort, sort_map["mix"])).skip(skip).limit(limit)
     raw_items = await cursor.to_list(limit)
-    items = [product_list_out(p) for p in raw_items]
+    items = [product_list_out(p) for p in raw_items if p]
     # category-name fallback: "telefon" matches category "Telefonlar"
     if search and not items and not skip:
         rx = {"$regex": re.escape(search), "$options": "i"}
@@ -728,7 +860,7 @@ async def list_products(
         if cats:
             cat_ids = [c["id"] for c in cats]
             by_cat = await db.products.find({**PRODUCT_FILTER, "$or": [{"category_id": {"$in": cat_ids}}, {"subcategory_id": {"$in": cat_ids}}]}).limit(limit).to_list(limit)
-            items = [product_out(p) for p in by_cat]
+            items = [product_list_out(p) for p in by_cat]
     # lightweight fuzzy (cap 200 docs, early exit)
     if search and not items and not skip and len(search) >= 3:
         needle = search.lower()
@@ -770,32 +902,52 @@ async def list_products(
                         break
         if fuzzy_cat_ids:
             by_cat = await db.products.find({**PRODUCT_FILTER, "$or": [{"category_id": {"$in": fuzzy_cat_ids}}, {"subcategory_id": {"$in": fuzzy_cat_ids}}]}).limit(limit).to_list(limit)
-            items = [product_out(p) for p in by_cat]
+            items = [product_list_out(p) for p in by_cat]
     total = await db.products.count_documents(q)
-    return {"items": items, "total": total}
+    payload = {"items": items, "total": total}
+    try:
+        if cache_key is not None:
+            _PRODUCTS_LIST_CACHE["data"][cache_key] = payload
+            _PRODUCTS_LIST_CACHE["expires"][cache_key] = time.time() + _PRODUCTS_LIST_TTL
+            if len(_PRODUCTS_LIST_CACHE["data"]) > 40:
+                oldest = sorted(_PRODUCTS_LIST_CACHE["expires"].items(), key=lambda x: x[1])[:20]
+                for k, _ in oldest:
+                    _PRODUCTS_LIST_CACHE["data"].pop(k, None)
+                    _PRODUCTS_LIST_CACHE["expires"].pop(k, None)
+    except Exception:
+        pass
+    return payload
 
 
 @api_router.get("/products/flash-sale")
 async def flash_sale():
-    items = await db.products.find({**PRODUCT_FILTER, "flash_sale.ends_at": {"$gt": iso()}}).to_list(20)
-    return [product_out(p) for p in items]
+    try:
+        items = await db.products.find({**PRODUCT_FILTER, "flash_sale.ends_at": {"$gt": iso()}}).to_list(20)
+        return [product_list_out(p) for p in items if p]
+    except Exception as e:
+        logger.exception("flash_sale failed: %s", e)
+        return []
 
 
 @api_router.get("/products/recommendations")
 async def recommendations(user=Depends(get_user_optional)):
-    cat_ids = []
-    if user:
-        views = await db.views.find({"user_id": user["id"]}).sort("at", -1).to_list(20)
-        cat_ids = list({v["category_id"] for v in views if v.get("category_id")})
-    q = dict(PRODUCT_FILTER)
-    if cat_ids:
-        q["category_id"] = {"$in": cat_ids}
-    items = await db.products.find(q).sort("sold", -1).limit(10).to_list(10)
-    if len(items) < 6:
-        more = await db.products.find(PRODUCT_FILTER).sort("views", -1).limit(10).to_list(10)
-        seen = {p["id"] for p in items}
-        items += [p for p in more if p["id"] not in seen]
-    return [product_out(p) for p in items[:10]]
+    try:
+        cat_ids = []
+        if user:
+            views = await db.views.find({"user_id": user["id"]}).sort("at", -1).to_list(20)
+            cat_ids = list({v["category_id"] for v in views if v.get("category_id")})
+        q = dict(PRODUCT_FILTER)
+        if cat_ids:
+            q["category_id"] = {"$in": cat_ids}
+        items = await db.products.find(q).sort("sold", -1).limit(10).to_list(10)
+        if len(items) < 6:
+            more = await db.products.find(PRODUCT_FILTER).sort("views", -1).limit(10).to_list(10)
+            seen = {p["id"] for p in items}
+            items += [p for p in more if p["id"] not in seen]
+        return [product_list_out(p) for p in items[:10] if p]
+    except Exception as e:
+        logger.exception("recommendations failed: %s", e)
+        return []
 
 
 @api_router.get("/products/{pid}")
@@ -855,6 +1007,342 @@ async def suggest(q: str = ""):
     prods = await db.products.find({**PRODUCT_FILTER, "$or": [{"name.uz": rx}, {"name.ru": rx}, {"name.en": rx}]}, {"_id": 0, "name": 1}).limit(6).to_list(6)
     return {"suggestions": list({(p.get("name") or {}).get("uz") or "" for p in prods if (p.get("name") or {}).get("uz")})}
 
+"""
+Rasm orqali qidiruv — backend qo'shimchasi
+================================================
+Quyidagilarni server.py (asosiy FastAPI fayl) ga qo'shing.
+
+1) Importlarga qo'shing (yuqoriga):
+   from fastapi import File, UploadFile
+   import io
+   import math
+   import struct
+
+2) /search/suggest dan KEYIN quyidagi kodni joylashtiring.
+
+Pillow ixtiyoriy: `pip install pillow` (tavsiya etiladi).
+Pillow bo'lmasa ham endpoint ishlaydi — soddaroq RGB o'rtacha bilan.
+"""
+
+# ===== PASTE FROM HERE (after /search/suggest) =====
+
+# ---------- Image search (visual similarity) ----------
+def _avg_rgb_from_jpeg_rough(data: bytes):
+    """Very rough fallback without Pillow: sample bytes as pseudo RGB."""
+    if not data or len(data) < 64:
+        return (128.0, 128.0, 128.0)
+    # skip header-ish region, sample every Nth byte
+    sample = data[min(100, len(data) // 10) :]
+    step = max(1, len(sample) // 3000)
+    rs, gs, bs, n = 0, 0, 0, 0
+    for i in range(0, len(sample) - 2, step * 3):
+        rs += sample[i]
+        gs += sample[i + 1]
+        bs += sample[i + 2]
+        n += 1
+        if n >= 1000:
+            break
+    if n == 0:
+        return (128.0, 128.0, 128.0)
+    return (rs / n, gs / n, bs / n)
+
+
+
+
+# ---- Visual search: tez + ishonchli ----
+_IMAGE_FEAT_CACHE: Dict[str, Any] = {}
+_IMAGE_FEAT_CACHE_MAX = 2000
+
+
+def _image_signature(data: bytes) -> str:
+    import hashlib
+    if not data:
+        return ""
+    return f"{len(data)}:{hashlib.md5(data).hexdigest()}"
+
+
+def _image_features_from_bytes(data: bytes):
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        w, h = img.size
+        if w < 1 or h < 1:
+            raise ValueError("empty")
+        small = img.copy()
+        small.thumbnail((16, 16))
+        pixels = list(small.getdata())
+        n = len(pixels) or 1
+        ar = sum(p[0] for p in pixels) / n
+        ag = sum(p[1] for p in pixels) / n
+        ab = sum(p[2] for p in pixels) / n
+        try:
+            resample = Image.Resampling.BILINEAR
+        except AttributeError:
+            resample = Image.BILINEAR
+        grid = img.resize((4, 4), resample)
+        grid_feats = []
+        for r, g, b in grid.getdata():
+            grid_feats.extend([float(r), float(g), float(b)])
+        aspect = float(w) / float(h) if h else 1.0
+        return [float(ar), float(ag), float(ab)] + grid_feats + [aspect]
+    except Exception:
+        try:
+            ar, ag, ab = _avg_rgb_from_jpeg_rough(data)
+        except Exception:
+            ar = ag = ab = 128.0
+        return [ar, ag, ab] + [ar, ag, ab] * 16 + [1.0]
+
+
+def _feature_distance(a, b) -> float:
+    if not a or not b:
+        return 1e9
+    n = min(len(a), len(b))
+    s = 0.0
+    for i in range(n):
+        try:
+            d = float(a[i]) - float(b[i])
+        except Exception:
+            continue
+        s += d * d
+    return math.sqrt(s)
+
+
+def _decode_data_uri(s: str) -> Optional[bytes]:
+    if not s or not isinstance(s, str):
+        return None
+    s = s.strip()
+    if s.startswith("data:") and "," in s:
+        try:
+            import base64
+            return base64.b64decode(s.split(",", 1)[1])
+        except Exception:
+            return None
+    return None
+
+
+def _first_image_ref(p: dict) -> Optional[str]:
+    if not isinstance(p, dict):
+        return None
+    imgs = p.get("images")
+    if isinstance(imgs, list):
+        for x in imgs:
+            if isinstance(x, str) and len(x.strip()) > 10:
+                return x.strip()
+            if isinstance(x, dict):
+                for k in ("url", "image", "src", "uri", "path"):
+                    if x.get(k) and str(x[k]).strip():
+                        return str(x[k]).strip()
+    for k in ("image", "preview_image", "main_image", "thumbnail", "photo"):
+        v = p.get(k)
+        if isinstance(v, str) and len(v.strip()) > 10:
+            return v.strip()
+    return None
+
+
+def _load_image_bytes(image_ref: str) -> Optional[bytes]:
+    """data-URI yoki (sinxron emas) HTTP — HTTP ni caller async qiladi."""
+    if not image_ref:
+        return None
+    raw = _decode_data_uri(image_ref)
+    if raw:
+        return raw
+    return None
+
+
+def _visual_search_out(p: dict):
+    try:
+        return product_list_out(p)
+    except Exception:
+        try:
+            return json_safe(product_out(p))
+        except Exception:
+            return {"id": (p or {}).get("id"), "name": {"uz": "Mahsulot"}, "images": [], "out_of_stock": True}
+
+
+def _shrink_bytes(data: bytes, max_side: int = 256) -> bytes:
+    if not data or len(data) < 50_000:
+        return data
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(data)).convert("RGB")
+        im.thumbnail((max_side, max_side))
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=70)
+        return buf.getvalue()
+    except Exception:
+        return data[:800_000]
+
+
+def _feat_from_product(p: dict):
+    """(feat, sig) yoki (None, '')."""
+    pid = str(p.get("id") or "")
+    stored = p.get("image_feat")
+    stored_sig = str(p.get("image_sig") or "")
+    if isinstance(stored, list) and len(stored) >= 10:
+        _IMAGE_FEAT_CACHE[pid] = {"feat": stored, "sig": stored_sig}
+        return stored, stored_sig
+    if pid and pid in _IMAGE_FEAT_CACHE:
+        c = _IMAGE_FEAT_CACHE[pid]
+        return c.get("feat"), c.get("sig") or ""
+
+    ref = _first_image_ref(p)
+    if not ref:
+        return None, ""
+    raw = _load_image_bytes(ref)
+    if not raw:
+        return None, ""  # HTTP — keyinroq async
+    raw = _shrink_bytes(raw)
+    sig = _image_signature(raw)
+    feat = _image_features_from_bytes(raw)
+    if pid:
+        _IMAGE_FEAT_CACHE[pid] = {"feat": feat, "sig": sig}
+        if len(_IMAGE_FEAT_CACHE) > _IMAGE_FEAT_CACHE_MAX:
+            for k in list(_IMAGE_FEAT_CACHE.keys())[: _IMAGE_FEAT_CACHE_MAX // 2]:
+                _IMAGE_FEAT_CACHE.pop(k, None)
+    return feat, sig
+
+
+@api_router.post("/search/by-image")
+async def search_by_image(image: UploadFile = File(...)):
+    """
+    1) Bir xil rasm (MD5) → darhol
+    2) 2.5s ichida eng yaqinlar
+    3) Hech narsa topilmasa → mashhur mahsulotlar (bo'sh emas)
+    """
+    t0 = time.time()
+    TIME_BUDGET = 2.5
+
+    try:
+        data = await image.read()
+    except Exception:
+        raise HTTPException(400, "Rasm o'qilmadi")
+    if not data or len(data) < 24:
+        raise HTTPException(400, "Rasm bo'sh yoki juda kichik")
+
+    data = _shrink_bytes(data, max_side=512)
+    query_sig = _image_signature(data)
+    query_feat = _image_features_from_bytes(data)
+
+    try:
+        candidates = await (
+            db.products.find(PRODUCT_FILTER)
+            .sort([("pinned", -1), ("sold", -1)])
+            .limit(60)
+            .max_time_ms(5000)
+            .to_list(60)
+        )
+    except Exception as e:
+        logger.exception("search_by_image candidates: %s", e)
+        candidates = []
+
+    if not candidates:
+        return {"items": [], "exact": False, "took_ms": int((time.time() - t0) * 1000)}
+
+    exact_hits = []
+    scored = []
+    to_persist = []
+    need_http = []  # (p, ref) HTTP rasmlar
+
+    for p in candidates:
+        if time.time() - t0 > TIME_BUDGET:
+            break
+        try:
+            feat, sig = _feat_from_product(p)
+            if feat is None:
+                ref = _first_image_ref(p)
+                if ref and (ref.startswith("http://") or ref.startswith("https://")):
+                    need_http.append((p, ref))
+                continue
+            if sig and query_sig and sig == query_sig:
+                exact_hits.append(p)
+                continue
+            dist = _feature_distance(query_feat, feat)
+            scored.append((dist, p))
+            if p.get("id") and not p.get("image_feat"):
+                to_persist.append((p["id"], feat, sig))
+        except Exception:
+            continue
+
+    # Bir nechta HTTP rasmni parallel yuklash (qolgan vaqt ichida)
+    remain = TIME_BUDGET - (time.time() - t0)
+    if need_http and remain > 0.4:
+        import httpx
+        sem = asyncio.Semaphore(6)
+
+        async def fetch_one(p, ref):
+            try:
+                async with sem:
+                    async with httpx.AsyncClient(timeout=min(1.2, remain), follow_redirects=True) as c:
+                        r = await c.get(ref)
+                        if r.status_code != 200 or not r.content:
+                            return None
+                        raw = _shrink_bytes(r.content)
+                        feat = _image_features_from_bytes(raw)
+                        sig = _image_signature(raw)
+                        pid = str(p.get("id") or "")
+                        if pid:
+                            _IMAGE_FEAT_CACHE[pid] = {"feat": feat, "sig": sig}
+                        return (p, feat, sig)
+            except Exception:
+                return None
+
+        http_results = await asyncio.gather(
+            *[fetch_one(p, ref) for p, ref in need_http[:20]],
+            return_exceptions=True,
+        )
+        for r in http_results:
+            if not isinstance(r, tuple):
+                continue
+            p, feat, sig = r
+            if sig and query_sig and sig == query_sig:
+                exact_hits.append(p)
+            else:
+                scored.append((_feature_distance(query_feat, feat), p))
+                if p.get("id") and not p.get("image_feat"):
+                    to_persist.append((p["id"], feat, sig))
+
+    if to_persist:
+        asyncio.create_task(_persist_image_feats(to_persist[:40]))
+
+    if exact_hits:
+        return {
+            "items": [_visual_search_out(p) for p in exact_hits[:12]],
+            "exact": True,
+            "took_ms": int((time.time() - t0) * 1000),
+        }
+
+    if scored:
+        scored.sort(key=lambda x: x[0])
+        top = [p for _, p in scored[:24]]
+        return {
+            "items": [_visual_search_out(p) for p in top],
+            "exact": False,
+            "took_ms": int((time.time() - t0) * 1000),
+        }
+
+    # Hech qanday feature o'qilmasa — mashhur mahsulotlarni qaytaramiz (bo'sh UI bo'lmasin)
+    popular = sorted(
+        candidates,
+        key=lambda x: (-int(x.get("sold") or 0), -float(x.get("rating") or 0)),
+    )[:20]
+    return {
+        "items": [_visual_search_out(p) for p in popular],
+        "exact": False,
+        "fallback": True,
+        "took_ms": int((time.time() - t0) * 1000),
+    }
+
+
+async def _persist_image_feats(pairs):
+    try:
+        for pid, feat, sig in pairs:
+            await db.products.update_one(
+                {"id": pid},
+                {"$set": {"image_feat": feat, "image_sig": sig}},
+            )
+    except Exception as e:
+        logger.warning("persist image_feat failed: %s", e)
+
 
 # ---------- Favorites ----------
 @api_router.post("/favorites/{pid}")
@@ -899,6 +1387,7 @@ async def create_order(req: OrderReq, user=Depends(get_user)):
         raise HTTPException(400, "Savat bo'sh")
     settings = await db.settings.find_one({"id": "main"}) or {}
     delivery_fee = settings.get("delivery_fee", 15000) if req.delivery_method == "courier" else 0
+    default_eta_days = int(settings.get("default_delivery_eta_days") or 0)
     by_seller: Dict[str, list] = {}
     subtotal_all = 0.0
     for it in req.items:
@@ -906,17 +1395,40 @@ async def create_order(req: OrderReq, user=Depends(get_user)):
         if not p or p.get("status") != "approved":
             raise HTTPException(400, "Mahsulot mavjud emas")
         out = product_out(p)
-        sale_units = int(out.get("sale_units") or 1)
-        requested_units = it.qty * sale_units
-        if p.get("stock", 0) < requested_units:
-            raise HTTPException(400, f"{p['name']['uz']}: omborda yetarli emas ({max(int(out.get('display_stock', 0) or 0), 0)} {out.get('display_stock_label', 'dona')})")
-        price = float(out.get("display_price", out["effective_price"]))
-        base_price = float(out.get("seller_display_price", out.get("seller_effective_price", p["price"])))
+        upb = int(out.get("units_per_box") or 0)
+        unit_type = out.get("unit_type") or "piece"
+        variation = (it.variation or "").lower()
+        # Savatdan kelgan tanlov: "quti..." → box, aks holda dona/kg
+        if unit_type == "kg":
+            sale_mode = "kg"
+            sale_units = 1
+            price = float(out.get("piece_price") or out.get("effective_price") or p.get("price") or 0)
+            base_price = float(out.get("seller_effective_price") or p.get("price") or 0)
+        elif upb > 0 and ("quti" in variation):
+            sale_mode = "box"
+            sale_units = upb
+            price = float(out.get("effective_box_price") or out.get("box_price") or (out.get("piece_price") or 0) * upb)
+            base_price = float(out.get("seller_effective_box_price") or out.get("seller_box_price") or (out.get("seller_price") or p.get("price") or 0) * upb)
+        else:
+            # dona (yoki quti sozlanmagan)
+            sale_mode = "piece"
+            sale_units = 1
+            price = float(out.get("piece_price") or out.get("effective_price") or p.get("price") or 0)
+            base_price = float(out.get("seller_effective_price") or out.get("seller_price") or p.get("price") or 0)
+
+        requested_units = int(it.qty) * sale_units
+        stock_left = int(p.get("stock", 0) or 0)
+        if stock_left < requested_units:
+            label = "kg" if sale_mode == "kg" else "dona"
+            raise HTTPException(
+                400,
+                f"{p['name']['uz']}: omborda yetarli emas ({stock_left} {label})",
+            )
         subtotal_all += price * it.qty
         by_seller.setdefault(p["seller_id"], []).append({
             "item_id": uid(), "product_id": p["id"], "name": p["name"], "image": (p.get("images") or [""])[0],
             "price": price, "base_price": base_price, "qty": it.qty, "variation": it.variation,
-            "sale_mode": out.get("sale_mode", "piece"), "units_per_box": int(out.get("units_per_box") or 0),
+            "sale_mode": sale_mode, "unit_type": unit_type, "units_per_box": upb,
             "ordered_units": requested_units,
             "delivery_status": "pending"})
     discount_all = 0.0
@@ -957,6 +1469,7 @@ async def create_order(req: OrderReq, user=Depends(get_user)):
             "delivery_location": {"lat": addr_lat, "lng": addr_lng} if addr_lat is not None and addr_lng is not None else None,
             "pickup_location": {"lat": slat, "lng": slng},
             "delivery_method": req.delivery_method,
+            "delivery_eta_days": default_eta_days if req.delivery_method == "courier" else 0,
             "payment_method": req.payment_method, "comment": req.comment, "courier_id": None,
             "status_history": [{"status": "new", "at": iso()}], "created_at": iso(),
         }
@@ -1522,17 +2035,21 @@ async def get_seller(user=Depends(get_user)):
 
 @api_router.get("/seller/products")
 async def seller_products(user=Depends(get_seller)):
-    """Lean seller product list — avoid loading full image blobs / Atlas memory errors."""
+    """Seller product list — birinchi rasmni ham qaytaramiz (card preview)."""
     try:
         pipeline = [
             {"$match": {"seller_id": user["id"]}},
             {"$project": {
                 "_id": 0,
                 "id": 1, "name": 1, "price": 1, "old_price": 1, "cost_price": 1,
-                "box_price": 1, "units_per_box": 1, "stock": 1, "status": 1,
+                "box_price": 1, "units_per_box": 1, "unit_type": 1, "stock": 1, "status": 1,
                 "hidden": 1, "pinned": 1, "sold": 1, "views": 1, "rating": 1,
                 "category_id": 1, "created_at": 1, "seller_id": 1,
                 "markup_percent": 1,
+                # faqat birinchi rasm — card uchun yetarli, xotira tejaydi
+                "images": {"$slice": [{"$ifNull": ["$images", []]}, 1]},
+                "image": 1,
+                "preview_image": 1,
             }},
             {"$sort": {"created_at": -1}},
             {"$limit": 150},
@@ -1541,17 +2058,25 @@ async def seller_products(user=Depends(get_seller)):
         out = []
         for p in raw:
             try:
-                # product_list_out needs images key
                 p = dict(p)
                 p.setdefault("images", [])
                 p.setdefault("desc", {"uz": "", "ru": "", "en": ""})
                 out.append(product_list_out(p))
             except Exception as e:
                 logger.exception("seller product row failed: %s", e)
+                # fallback: try keep first image if present on raw doc
+                imgs = p.get("images") if isinstance(p.get("images"), list) else []
+                first = ""
+                if imgs:
+                    first = str(imgs[0] or "")
+                elif isinstance(p.get("image"), str):
+                    first = p["image"]
                 out.append(json_safe({
                     "id": p.get("id"),
                     "name": p.get("name") if isinstance(p.get("name"), dict) else {"uz": str(p.get("name") or ""), "ru": "", "en": ""},
-                    "images": [],
+                    "images": [first] if first else [],
+                    "image": first or None,
+                    "preview_image": first or None,
                     "price": p.get("price") or 0,
                     "status": p.get("status") or "pending",
                     "stock": p.get("stock") or 0,
@@ -1570,8 +2095,9 @@ async def seller_add_product(req: ProductReq, user=Depends(get_seller)):
         "desc": {"uz": req.desc_uz, "ru": req.desc_ru or req.desc_uz, "en": req.desc_en or req.desc_uz},
         "category_id": req.category_id, "price": req.price, "old_price": req.old_price,
         "cost_price": req.cost_price or 0,
-        "box_price": req.box_price,
-        "units_per_box": max(int(req.units_per_box or 0), 0),
+        "box_price": None if str(getattr(req, "unit_type", "piece") or "piece").lower() == "kg" else req.box_price,
+        "units_per_box": 0 if str(getattr(req, "unit_type", "piece") or "piece").lower() == "kg" else max(int(req.units_per_box or 0), 0),
+        "unit_type": "kg" if str(getattr(req, "unit_type", "piece") or "piece").lower() == "kg" else "piece",
         "images": req.images or ["https://images.unsplash.com/photo-1553456558-aff63285bdd1?w=600&q=80"],
         "stock": req.stock, "variations": req.variations, "status": "pending", "hidden": False,
         "pinned": False, "rating": 0, "reviews_count": 0, "views": 0, "sold": 0, "created_at": iso(),
@@ -1590,8 +2116,9 @@ async def seller_edit_product(pid: str, req: ProductReq, user=Depends(get_seller
         "desc": {"uz": req.desc_uz, "ru": req.desc_ru or req.desc_uz, "en": req.desc_en or req.desc_uz},
         "category_id": req.category_id, "price": req.price, "old_price": req.old_price,
         "cost_price": req.cost_price if req.cost_price is not None else p.get("cost_price", 0),
-        "box_price": req.box_price,
-        "units_per_box": max(int(req.units_per_box or 0), 0),
+        "box_price": None if str(getattr(req, "unit_type", "piece") or "piece").lower() == "kg" else req.box_price,
+        "units_per_box": 0 if str(getattr(req, "unit_type", "piece") or "piece").lower() == "kg" else max(int(req.units_per_box or 0), 0),
+        "unit_type": "kg" if str(getattr(req, "unit_type", "piece") or "piece").lower() == "kg" else "piece",
         "stock": req.stock, "status": "pending",
     }
     if req.images:
@@ -1702,17 +2229,18 @@ async def seller_order_action(oid: str, req: ActionReq, user=Depends(get_seller)
     o = await db.orders.find_one({"id": oid, "seller_id": user["id"]}, {"_id": 0})
     if not o:
         raise HTTPException(404, "Topilmadi")
-    if req.action == "accept" and o["status"] == "new":
-        await set_order_status(o, "confirmed")
-    elif req.action == "reject" and o["status"] in ("new", "confirmed"):
-        for it in o.get("items") or []:
+
+    async def _full_reject(order_doc, reason: str):
+        for it in order_doc.get("items") or []:
+            if it.get("seller_status") == "rejected":
+                continue
             units = order_reset_units(it)
             await db.products.update_one({"id": it["product_id"]}, {"$inc": {"stock": units, "sold": -units}})
         rejection = {
             "rejected_at": iso(),
             "rejected_by": user["id"],
             "rejected_shop_name": (user.get("seller_info") or {}).get("shop_name", "Do'kon"),
-            "reason": req.reason or "Sotuvchi rad etdi",
+            "reason": reason or "Sotuvchi rad etdi",
             "reminder_due_at": iso(now() + timedelta(hours=1)),
         }
         await db.orders.update_one(
@@ -1722,10 +2250,120 @@ async def seller_order_action(oid: str, req: ActionReq, user=Depends(get_seller)
                 "$push": {"status_history": {"status": "seller_rejected", "at": iso(), "note": rejection["reason"]}},
             },
         )
-        await notify(o["client_id"], f"Buyurtma {o['number']}", "Sotuvchi buyurtmani rad etdi. Admin boshqa variant qidirmoqda")
+        await notify(order_doc["client_id"], f"Buyurtma {order_doc['number']}", "Sotuvchi buyurtmani rad etdi. Admin boshqa variant qidirmoqda")
         admins = await db.users.find({"role": "admin"}, {"_id": 0}).to_list(20)
         for admin_u in admins:
-            await notify(admin_u["id"], "Sotuvchi buyurtmani rad etdi", f"{o['number']} • {(user.get('seller_info') or {}).get('shop_name', user.get('first_name', 'Sotuvchi'))}")
+            await notify(
+                admin_u["id"],
+                "Sotuvchi buyurtmani rad etdi",
+                f"{order_doc['number']} • {(user.get('seller_info') or {}).get('shop_name', user.get('first_name', 'Sotuvchi'))}",
+            )
+
+    if req.action == "accept" and o["status"] == "new":
+        items = list(o.get("items") or [])
+        # partial: req.items berilgan bo'lsa har bir mahsulot bo'yicha
+        if req.items is not None and len(req.items) > 0:
+            decision_map = {}
+            for d in req.items:
+                act = (d.action or "accept").lower().strip()
+                if act not in ("accept", "reject"):
+                    act = "accept"
+                decision_map[int(d.index)] = act
+
+            accepted_items = []
+            rejected_items = []
+            for idx, it in enumerate(items):
+                act = decision_map.get(idx, "accept")
+                row = dict(it)
+                if act == "reject":
+                    row["seller_status"] = "rejected"
+                    units = order_reset_units(row)
+                    await db.products.update_one(
+                        {"id": row["product_id"]},
+                        {"$inc": {"stock": units, "sold": -units}},
+                    )
+                    rejected_items.append(row)
+                else:
+                    row["seller_status"] = "accepted"
+                    accepted_items.append(row)
+
+            if not accepted_items:
+                # hammasi rad
+                await _full_reject(o, req.reason or "Sotuvchi barcha mahsulotlarni rad etdi")
+                return {"ok": True, "mode": "full_reject"}
+
+            # qisman yoki to'liq qabul — summalarni qayta hisoblash
+            new_subtotal = sum(float(i.get("price") or 0) * int(i.get("qty") or 0) for i in accepted_items)
+            new_seller_sub = sum(
+                float(i.get("base_price", i.get("price") or 0) or 0) * int(i.get("qty") or 0)
+                for i in accepted_items
+            )
+            delivery_fee = float(o.get("delivery_fee") or 0)
+            discount = float(o.get("discount") or 0)
+            # chegirma nisbatini saqlab qolish (qisman bo'lsa proporsional)
+            old_sub = float(o.get("subtotal") or 0) or 1.0
+            new_discount = round(discount * (new_subtotal / old_sub), 2) if discount else 0.0
+            new_total = max(0.0, new_subtotal + delivery_fee - new_discount)
+
+            prev_rejected = list(o.get("seller_rejected_items") or [])
+            await db.orders.update_one(
+                {"id": oid},
+                {
+                    "$set": {
+                        "items": accepted_items,
+                        "seller_rejected_items": prev_rejected + rejected_items,
+                        "subtotal": new_subtotal,
+                        "seller_subtotal": new_seller_sub,
+                        "discount": new_discount,
+                        "total": new_total,
+                        "status": "confirmed",
+                        "partial_accept": len(rejected_items) > 0,
+                    },
+                    "$push": {
+                        "status_history": {
+                            "status": "confirmed",
+                            "at": iso(),
+                            "note": (
+                                f"Qisman qabul: {len(accepted_items)} ta qabul, {len(rejected_items)} ta rad"
+                                if rejected_items
+                                else "Sotuvchi qabul qildi"
+                            ),
+                        }
+                    },
+                },
+            )
+            if rejected_items:
+                names = ", ".join(
+                    str((it.get("name") or {}).get("uz") if isinstance(it.get("name"), dict) else it.get("name") or "?")
+                    for it in rejected_items
+                )
+                await notify(
+                    o["client_id"],
+                    f"Buyurtma {o['number']}",
+                    f"Sotuvchi ba'zi mahsulotlarni rad etdi: {names}. Qolganlari tasdiqlandi.",
+                )
+                admins = await db.users.find({"role": "admin"}, {"_id": 0}).to_list(20)
+                for admin_u in admins:
+                    await notify(
+                        admin_u["id"],
+                        "Qisman rad etilgan buyurtma",
+                        f"{o['number']} • rad: {len(rejected_items)} ta, qabul: {len(accepted_items)} ta",
+                    )
+            else:
+                await notify(o["client_id"], f"Buyurtma {o['number']}", "Sotuvchi buyurtmani tasdiqladi")
+            return {
+                "ok": True,
+                "mode": "partial" if rejected_items else "full_accept",
+                "accepted": len(accepted_items),
+                "rejected": len(rejected_items),
+            }
+
+        # oddiy to'liq qabul (items yuborilmagan)
+        await set_order_status(o, "confirmed")
+        return {"ok": True, "mode": "full_accept"}
+
+    elif req.action == "reject" and o["status"] in ("new", "confirmed"):
+        await _full_reject(o, req.reason or "Sotuvchi rad etdi")
     elif req.action == "packed" and o["status"] == "confirmed":
         await set_order_status(o, "packing")
     elif req.action == "payment_received" and o["status"] == "delivered":
@@ -3023,9 +3661,10 @@ async def admin_get_settings(user=Depends(get_admin)):
 async def admin_set_settings(req: SettingsReq, user=Depends(get_admin)):
     upd = {k: v for k, v in req.dict().items() if v is not None}
     await db.settings.update_one({"id": "main"}, {"$set": upd}, upsert=True)
-    s = await db.settings.find_one({"id": "main"}, {"_id": 0})
+    s = await db.settings.find_one({"id": "main"}, {"_id": 0}) or {}
     SETTINGS_CACHE["default_markup_percent"] = s.get("default_markup_percent", 0) or 0
-    return s
+    SETTINGS_CACHE["default_delivery_eta_days"] = int(s.get("default_delivery_eta_days") or 0)
+    return json_safe(s)
 
 
 @api_router.post("/admin/couriers")
@@ -3061,8 +3700,13 @@ async def admin_add_courier(req: CourierCreateReq, user=Depends(get_admin)):
 @api_router.get("/settings/public")
 async def public_settings():
     s = await db.settings.find_one({"id": "main"}, {"_id": 0}) or {}
-    return {"delivery_fee": s.get("delivery_fee", 15000), "min_order": s.get("min_order", 0),
-            "work_hours": s.get("work_hours", "09:00 - 21:00"), "contact": s.get("contact", "+998 71 200 00 00")}
+    return {
+        "delivery_fee": s.get("delivery_fee", 15000),
+        "min_order": s.get("min_order", 0),
+        "work_hours": s.get("work_hours", "09:00 - 21:00"),
+        "contact": s.get("contact", "+998 71 200 00 00"),
+        "default_delivery_eta_days": int(s.get("default_delivery_eta_days") or 0),
+    }
 
 
 @api_router.get("/download/source")
@@ -3258,130 +3902,82 @@ async def ensure_admin_courier_account():
 
 @app.on_event("startup")
 async def seed():
-    if await db.users.find_one({"phone": "+998900000000"}):
-        return
-    logger.info("Seeding demo data...")
+    """Faqat asosiy admin + sozlamalar. Demo sotuvchi/mahsulot/buyurtma YO'Q."""
+    try:
+        ADMIN_PHONE = "+998902149795"
+        # Eski demo admin raqamini yangisiga ko'chirish (bir marta)
+        old = await db.users.find_one({"phone": "+998900000000", "role": "admin"})
+        if old and not await db.users.find_one({"phone": ADMIN_PHONE}):
+            await db.users.update_one({"id": old["id"]}, {"$set": {"phone": ADMIN_PHONE}})
+            logger.info("Admin phone migrated to %s", ADMIN_PHONE)
 
-    def mkuser(phone, fn, ln, role, extra=None):
-        u = {"id": uid(), "phone": phone, "first_name": fn, "last_name": ln, "role": role, "language": "uz",
-             "blocked": False, "referral_code": f"UZ{random.randint(10000, 99999)}", "favorites": [],
-             "addresses": [{"id": uid(), "label": "Uy", "text": "Toshkent, Chilonzor tumani, 12-kvartal", "lat": 41.28, "lng": 69.2}],
-             "created_at": iso()}
-        if extra:
-            u.update(extra)
-        return u
-
-    admin = mkuser("+998900000000", "Admin", "Boshqaruvchi", "admin")
-    seller1 = mkuser("+998901111111", "Aziz", "Karimov", "client", {"seller_info": {"shop_name": "TechnoPlaza", "approved": True, "rejected": False, "commission": 10, "balance": 1250000, "rating": 4.8, "applied_at": iso()}})
-    seller2 = mkuser("+998904444444", "Malika", "Yusupova", "client", {"seller_info": {"shop_name": "Fashion House", "approved": True, "rejected": False, "commission": 12, "balance": 830000, "rating": 4.6, "applied_at": iso()}})
-    seller3 = mkuser("+998905555555", "Bobur", "Aliyev", "client", {"seller_info": {"shop_name": "Organic Market", "approved": False, "rejected": False, "commission": None, "balance": 0, "rating": 5.0, "applied_at": iso()}})
-    courier = mkuser("+998902222222", "Jasur", "Toshmatov", "courier", {"courier_info": {"online": True, "zone": "Chilonzor", "earnings": 345000, "deliveries": 23, "stats_reset_at": None, "is_admin_courier": False}})
-    # Yagona admin kuryer — telefon: +998906666666 (OTP orqali kiradi)
-    admin_courier = mkuser(
-        "+998906666666",
-        "Admin",
-        "Kuryer",
-        "admin_courier",
-        {
-            "courier_info": {
-                "online": True,
-                "zone": "Toshkent",
-                "earnings": 0,
-                "deliveries": 0,
-                "stats_reset_at": None,
-                "is_admin_courier": True,
+        admin = await db.users.find_one({"phone": ADMIN_PHONE})
+        if not admin:
+            admin = {
+                "id": uid(),
+                "phone": ADMIN_PHONE,
+                "first_name": "Admin",
+                "last_name": "Boshqaruvchi",
+                "role": "admin",
+                "language": "uz",
+                "blocked": False,
+                "referral_code": f"UZ{random.randint(10000, 99999)}",
+                "favorites": [],
+                "addresses": [],
+                "created_at": iso(),
             }
-        },
-    )
-    client_u = mkuser("+998903333333", "Dilnoza", "Rahimova", "client")
-    for u in (admin, seller1, seller2, seller3, courier, admin_courier, client_u):
-        await db.users.insert_one(dict(u))
+            await db.users.insert_one(dict(admin))
+            logger.info("Admin account created: %s", ADMIN_PHONE)
+        else:
+            # role kafolati
+            if admin.get("role") != "admin":
+                await db.users.update_one({"id": admin["id"]}, {"$set": {"role": "admin"}})
 
-    cats_def = [
-        ("Elektronika", "Электроника", "Electronics", "devices", [("Telefonlar", "Телефоны", "Phones"), ("Noutbuklar", "Ноутбуки", "Laptops"), ("Aksessuarlar", "Аксессуары", "Accessories")]),
-        ("Kiyim", "Одежда", "Clothing", "checkroom", [("Erkaklar", "Мужчинам", "Men"), ("Ayollar", "Женщинам", "Women")]),
-        ("Uy-ro'zg'or", "Дом и быт", "Home", "chair", [("Mebel", "Мебель", "Furniture"), ("Oshxona", "Кухня", "Kitchen")]),
-        ("Go'zallik", "Красота", "Beauty", "spa", [("Parfyumeriya", "Парфюмерия", "Perfume"), ("Parvarish", "Уход", "Care")]),
-        ("Sport", "Спорт", "Sport", "fitness-center", [("Trenajyor", "Тренажёры", "Fitness"), ("Sport anjomlar", "Инвентарь", "Equipment")]),
-        ("Oziq-ovqat", "Продукты", "Food", "restaurant", [("Shirinliklar", "Сладости", "Sweets"), ("Sog'lom oziq", "Здоровое питание", "Healthy")]),
-    ]
-    cat_ids = {}
-    for i, (uz_, ru_, en_, icon, subs) in enumerate(cats_def):
-        cid = uid()
-        cat_ids[uz_] = cid
-        await db.categories.insert_one({"id": cid, "name": {"uz": uz_, "ru": ru_, "en": en_}, "icon": icon, "parent_id": None, "order": i})
-        for j, (suz, sru, sen) in enumerate(subs):
-            scid = uid()
-            cat_ids[suz] = scid
-            await db.categories.insert_one({"id": scid, "name": {"uz": suz, "ru": sru, "en": sen}, "icon": icon, "parent_id": cid, "order": j})
+        # Demo test akkauntlarni o'chirish (static seed qoldiqlari)
+        DEMO_PHONES = [
+            "+998900000000",
+            "+998901111111",
+            "+998902222222",
+            "+998903333333",
+            "+998904444444",
+            "+998905555555",
+        ]
+        demo_users = await db.users.find({"phone": {"$in": DEMO_PHONES}}, {"_id": 0, "id": 1, "phone": 1}).to_list(50)
+        demo_ids = [u["id"] for u in demo_users]
+        if demo_ids:
+            await db.users.delete_many({"id": {"$in": demo_ids}})
+            await db.products.delete_many({"seller_id": {"$in": demo_ids}})
+            await db.orders.delete_many({
+                "$or": [
+                    {"seller_id": {"$in": demo_ids}},
+                    {"client_id": {"$in": demo_ids}},
+                    {"courier_id": {"$in": demo_ids}},
+                ]
+            })
+            await db.reviews.delete_many({"client_id": {"$in": demo_ids}})
+            logger.info("Removed %s demo users and related data: %s", len(demo_ids), [u["phone"] for u in demo_users])
 
-    def mkprod(seller, nuz, nru, nen, cat, sub, price, old, img, stock, sold, rating, rcount, pinned=False, variations=None, flash=None):
-        return {"id": uid(), "seller_id": seller["id"],
-                "name": {"uz": nuz, "ru": nru, "en": nen},
-                "desc": {"uz": f"{nuz} — yuqori sifatli mahsulot. Rasmiy kafolat bilan. Tez yetkazib berish.",
-                         "ru": f"{nru} — товар высокого качества с официальной гарантией.",
-                         "en": f"{nen} — high quality product with official warranty."},
-                "category_id": cat_ids[cat], "subcategory_id": cat_ids.get(sub), "price": price, "old_price": old,
-                "images": [img], "stock": stock, "variations": variations or [], "status": "approved", "hidden": False,
-                "pinned": pinned, "rating": rating, "reviews_count": rcount, "views": random.randint(50, 900),
-                "sold": sold, "flash_sale": flash, "created_at": iso()}
+        # Minimal sozlamalar (yo'q bo'lsa)
+        if not await db.settings.find_one({"id": "main"}):
+            await db.settings.update_one(
+                {"id": "main"},
+                {"$set": {
+                    "id": "main",
+                    "delivery_fee": 15000,
+                    "min_order": 0,
+                    "commission_default": 10,
+                    "default_markup_percent": 0,
+                    "default_delivery_eta_days": 2,
+                    "work_hours": "09:00 - 21:00",
+                    "contact": "+998902149795",
+                }},
+                upsert=True,
+            )
+            logger.info("Default settings created")
 
-    flash_end = iso(now() + timedelta(hours=8))
-    color_var = [{"name": "Rang", "options": [{"label": "Qora", "price_delta": 0, "stock": 5}, {"label": "Oq", "price_delta": 0, "stock": 3}, {"label": "Yashil", "price_delta": 50000, "stock": 2}]}]
-    mem_var = [{"name": "Xotira", "options": [{"label": "128 GB", "price_delta": 0, "stock": 4}, {"label": "256 GB", "price_delta": 1500000, "stock": 3}]}]
-    size_var = [{"name": "O'lcham", "options": [{"label": "S", "price_delta": 0, "stock": 4}, {"label": "M", "price_delta": 0, "stock": 6}, {"label": "L", "price_delta": 0, "stock": 2}, {"label": "XL", "price_delta": 10000, "stock": 3}]}]
-
-    products = [
-        mkprod(seller1, "Smartfon Galaxy A55 5G", "Смартфон Galaxy A55 5G", "Galaxy A55 5G Smartphone", "Elektronika", "Telefonlar", 4200000, 4800000, IMG["phone"], 12, 156, 4.7, 42, True, mem_var, {"price": 3990000, "ends_at": flash_end}),
-        mkprod(seller1, "iPhone 15 Pro 256GB", "iPhone 15 Pro 256GB", "iPhone 15 Pro 256GB", "Elektronika", "Telefonlar", 14500000, None, IMG["phone2"], 5, 89, 4.9, 31, True, mem_var),
-        mkprod(seller1, "Noutbuk Lenovo IdeaPad 5", "Ноутбук Lenovo IdeaPad 5", "Lenovo IdeaPad 5 Laptop", "Elektronika", "Noutbuklar", 8900000, 9900000, IMG["laptop"], 7, 64, 4.6, 18),
-        mkprod(seller1, "Simsiz quloqchin Sony WH-1000", "Беспроводные наушники Sony", "Sony Wireless Headphones", "Elektronika", "Aksessuarlar", 2100000, 2600000, IMG["headphones"], 20, 203, 4.8, 57, False, color_var, {"price": 1890000, "ends_at": flash_end}),
-        mkprod(seller1, "Smart soat Amazfit GTR 4", "Смарт-часы Amazfit GTR 4", "Amazfit GTR 4 Smart Watch", "Elektronika", "Aksessuarlar", 1650000, 1900000, IMG["watch"], 15, 134, 4.5, 29, False, color_var),
-        mkprod(seller2, "Erkaklar futbolkasi Premium", "Мужская футболка Premium", "Men's Premium T-Shirt", "Kiyim", "Erkaklar", 145000, 195000, IMG["tshirt"], 40, 312, 4.4, 88, False, size_var, {"price": 119000, "ends_at": flash_end}),
-        mkprod(seller2, "Krossovka Nike Air Zoom", "Кроссовки Nike Air Zoom", "Nike Air Zoom Sneakers", "Kiyim", "Erkaklar", 1250000, 1550000, IMG["sneakers"], 18, 178, 4.7, 45, True, size_var),
-        mkprod(seller2, "Ayollar kurtkasi Winter", "Женская куртка Winter", "Women's Winter Jacket", "Kiyim", "Ayollar", 890000, 1200000, IMG["jacket"], 3, 95, 4.6, 22, False, size_var),
-        mkprod(seller2, "Divan Comfort 3-o'rinli", "Диван Comfort 3-местный", "Comfort 3-seat Sofa", "Uy-ro'zg'or", "Mebel", 5600000, 6500000, IMG["sofa"], 4, 27, 4.5, 9),
-        mkprod(seller2, "Stol lampasi Loft", "Настольная лампа Loft", "Loft Table Lamp", "Uy-ro'zg'or", "Mebel", 320000, None, IMG["lamp"], 25, 68, 4.3, 15),
-        mkprod(seller1, "Elektr choynak Bosch 1.7L", "Электрочайник Bosch 1.7л", "Bosch Electric Kettle 1.7L", "Uy-ro'zg'or", "Oshxona", 480000, 560000, IMG["kettle"], 30, 142, 4.6, 38),
-        mkprod(seller2, "Atir Dior Sauvage 100ml", "Духи Dior Sauvage 100мл", "Dior Sauvage Perfume 100ml", "Go'zallik", "Parfyumeriya", 1850000, 2100000, IMG["perfume"], 8, 76, 4.8, 21),
-        mkprod(seller2, "Yuz kremi Nivea Care", "Крем для лица Nivea Care", "Nivea Care Face Cream", "Go'zallik", "Parvarish", 95000, 120000, IMG["cream"], 50, 254, 4.4, 63),
-        mkprod(seller1, "Futbol to'pi Adidas Pro", "Футбольный мяч Adidas Pro", "Adidas Pro Football", "Sport", "Sport anjomlar", 380000, 450000, IMG["ball"], 22, 118, 4.5, 27),
-        mkprod(seller1, "Gantellar to'plami 20kg", "Набор гантелей 20кг", "Dumbbell Set 20kg", "Sport", "Trenajyor", 750000, None, IMG["dumbbell"], 10, 54, 4.7, 12),
-        mkprod(seller2, "Tog' asali 1kg", "Горный мёд 1кг", "Mountain Honey 1kg", "Oziq-ovqat", "Sog'lom oziq", 150000, 180000, IMG["honey"], 35, 198, 4.9, 74),
-        mkprod(seller2, "Quruq mevalar to'plami", "Набор сухофруктов", "Dried Fruits Mix", "Oziq-ovqat", "Sog'lom oziq", 220000, None, IMG["nuts"], 28, 87, 4.6, 19),
-        mkprod(seller1, "Powerbank Xiaomi 20000mAh", "Повербанк Xiaomi 20000mAh", "Xiaomi Powerbank 20000mAh", "Elektronika", "Aksessuarlar", 350000, 420000, IMG["phone2"], 0, 167, 4.5, 33),
-    ]
-    pending = mkprod(seller1, "Yangi planshet Tab S9", "Новый планшет Tab S9", "New Tab S9 Tablet", "Elektronika", "Telefonlar", 6200000, None, IMG["laptop"], 6, 0, 0, 0)
-    pending["status"] = "pending"
-    products.append(pending)
-    for p in products:
-        await db.products.insert_one(dict(p))
-
-    banners = [
-        {"id": uid(), "image": IMG["banner1"], "title": "Yangi mavsum kolleksiyasi — 40% gacha chegirma", "link_type": "category", "link_id": cat_ids["Kiyim"], "active": True, "order": 0, "expires_at": None, "created_at": iso()},
-        {"id": uid(), "image": IMG["banner2"], "title": "Elektronika festivali boshlandi", "link_type": "category", "link_id": cat_ids["Elektronika"], "active": True, "order": 1, "expires_at": None, "created_at": iso()},
-        {"id": uid(), "image": IMG["banner3"], "title": "Flash Sale — bugun tugaydi!", "link_type": "flash", "link_id": None, "active": True, "order": 2, "expires_at": None, "created_at": iso()},
-    ]
-    for b in banners:
-        await db.banners.insert_one(dict(b))
-
-    await db.promocodes.insert_one({"id": uid(), "code": "WELCOME10", "type": "percent", "value": 10, "min_cart": 100000, "limit": 100, "used": 3, "expires_at": None, "active": True, "created_at": iso()})
-    await db.promocodes.insert_one({"id": uid(), "code": "SALE50K", "type": "amount", "value": 50000, "min_cart": 500000, "limit": 50, "used": 1, "expires_at": None, "active": True, "created_at": iso()})
-    await db.settings.update_one({"id": "main"}, {"$set": {"delivery_fee": 15000, "min_order": 50000, "commission_default": 10, "default_markup_percent": 0, "work_hours": "09:00 - 21:00", "contact": "+998 71 200 00 00"}}, upsert=True)
- 
-    # sample delivered order for demo client so reviews work
-    p0 = products[0]
-    o = {"id": uid(), "number": "#1000", "group_id": uid(), "client_id": client_u["id"], "client_name": "Dilnoza Rahimova",
-         "client_phone": client_u["phone"], "seller_id": seller1["id"],
-         "items": [{"product_id": p0["id"], "name": p0["name"], "image": p0["images"][0], "price": p0["price"], "qty": 1, "variation": "128 GB"}],
-         "subtotal": p0["price"], "delivery_fee": 15000, "discount": 0, "total": p0["price"] + 15000, "promo_code": None,
-         "status": "delivered", "address_text": "Toshkent, Chilonzor tumani, 12-kvartal", "delivery_method": "courier",
-         "payment_method": "cash", "comment": "", "courier_id": courier["id"], 
-         "status_history": [{"status": s, "at": iso(now() - timedelta(days=2, hours=5 - i))} for i, s in enumerate(STATUS_FLOW)],
-         "created_at": iso(now() - timedelta(days=2))} 
-    await db.orders.insert_one(dict(o))
-    await db.reviews.insert_one({"id": uid(), "product_id": p0["id"], "client_id": client_u["id"], "client_name": "Dilnoza Rahimova", "rating": 5, "text": "Juda zo'r telefon, tez yetkazib berishdi. Tavsiya qilaman!", "verified": True, "created_at": iso(now() - timedelta(days=1))})
-    logger.info("Seed complete")
+        logger.info("Seed done (no demo catalog)")
+    except Exception as e:
+        logger.exception("seed failed: %s", e)
 
 
 @app.on_event("shutdown")
