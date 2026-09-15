@@ -1062,49 +1062,65 @@ def _image_signature(data: bytes) -> str:
 
 
 def _image_features_from_bytes(data: bytes):
+    """Rang + 8x8 grid + histogram — o'xshashlik uchun yaxshiroq."""
     try:
         from PIL import Image
         img = Image.open(io.BytesIO(data)).convert("RGB")
         w, h = img.size
         if w < 1 or h < 1:
             raise ValueError("empty")
+        try:
+            resample = Image.Resampling.BILINEAR
+        except AttributeError:
+            resample = Image.BILINEAR
+        # global average on small thumb
         small = img.copy()
-        small.thumbnail((16, 16))
+        small.thumbnail((32, 32))
         pixels = list(small.getdata())
         n = len(pixels) or 1
         ar = sum(p[0] for p in pixels) / n
         ag = sum(p[1] for p in pixels) / n
         ab = sum(p[2] for p in pixels) / n
-        try:
-            resample = Image.Resampling.BILINEAR
-        except AttributeError:
-            resample = Image.BILINEAR
-        grid = img.resize((4, 4), resample)
+        # 8x8 spatial grid (stronger than 4x4)
+        grid = img.resize((8, 8), resample)
         grid_feats = []
         for r, g, b in grid.getdata():
-            grid_feats.extend([float(r), float(g), float(b)])
+            grid_feats.extend([float(r) / 255.0, float(g) / 255.0, float(b) / 255.0])
+        # coarse RGB histogram (4 bins each)
+        hist = [0.0] * 12
+        for r, g, b in pixels:
+            hist[min(3, r * 4 // 256)] += 1
+            hist[4 + min(3, g * 4 // 256)] += 1
+            hist[8 + min(3, b * 4 // 256)] += 1
+        inv = 1.0 / float(n)
+        hist = [x * inv for x in hist]
         aspect = float(w) / float(h) if h else 1.0
-        return [float(ar), float(ag), float(ab)] + grid_feats + [aspect]
+        return [ar / 255.0, ag / 255.0, ab / 255.0] + grid_feats + hist + [aspect]
     except Exception:
         try:
             ar, ag, ab = _avg_rgb_from_jpeg_rough(data)
         except Exception:
             ar = ag = ab = 128.0
-        return [ar, ag, ab] + [ar, ag, ab] * 16 + [1.0]
+        return [ar / 255.0, ag / 255.0, ab / 255.0] + [0.5] * (64 * 3) + [0.25] * 12 + [1.0]
 
 
 def _feature_distance(a, b) -> float:
+    """Kichikroq = o'xshashroq. Turli uzunlikdagi eski cache ham ishlaydi."""
     if not a or not b:
         return 1e9
     n = min(len(a), len(b))
+    if n < 3:
+        return 1e9
     s = 0.0
     for i in range(n):
         try:
             d = float(a[i]) - float(b[i])
         except Exception:
             continue
-        s += d * d
-    return math.sqrt(s)
+        # grid/hist o'rtacha, global rang biroz og'irroq
+        w = 2.0 if i < 3 else 1.0
+        s += w * d * d
+    return math.sqrt(s / n)
 
 
 def _decode_data_uri(s: str) -> Optional[bytes]:
@@ -1205,12 +1221,12 @@ def _feat_from_product(p: dict):
 @api_router.post("/search/by-image")
 async def search_by_image(image: UploadFile = File(...)):
     """
-    1) Bir xil rasm (MD5) → darhol
-    2) 2.5s ichida eng yaqinlar
-    3) Hech narsa topilmasa → mashhur mahsulotlar (bo'sh emas)
+    Eng o'xshash mahsulot BIRINCHI.
+    1) MD5 aniq moslik
+    2) image_feat masofa bo'yicha sort (kichik → birinchi)
     """
     t0 = time.time()
-    TIME_BUDGET = 2.5
+    TIME_BUDGET = 3.5
 
     try:
         data = await image.read()
@@ -1223,56 +1239,99 @@ async def search_by_image(image: UploadFile = File(...)):
     query_sig = _image_signature(data)
     query_feat = _image_features_from_bytes(data)
 
+    # 1) Avval feature allaqachon bor mahsulotlar (tez, butun katalog)
+    precomputed = []
     try:
-        candidates = await (
-            db.products.find(PRODUCT_FILTER)
-            .sort([("pinned", -1), ("sold", -1)])
-            .limit(60)
-            .max_time_ms(5000)
-            .to_list(60)
+        precomputed = await (
+            db.products.find(
+                {**PRODUCT_FILTER, "image_feat": {"$exists": True, "$type": "array"}},
+            )
+            .limit(500)
+            .max_time_ms(4000)
+            .to_list(500)
         )
     except Exception as e:
-        logger.exception("search_by_image candidates: %s", e)
-        candidates = []
-
-    if not candidates:
-        return {"items": [], "exact": False, "took_ms": int((time.time() - t0) * 1000)}
+        logger.warning("search precomputed: %s", e)
 
     exact_hits = []
-    scored = []
-    to_persist = []
-    need_http = []  # (p, ref) HTTP rasmlar
+    scored = []  # (dist, product)
 
-    for p in candidates:
+    for p in precomputed:
         if time.time() - t0 > TIME_BUDGET:
             break
         try:
-            feat, sig = _feat_from_product(p)
-            if feat is None:
-                ref = _first_image_ref(p)
-                if ref and (ref.startswith("http://") or ref.startswith("https://")):
-                    need_http.append((p, ref))
+            feat = p.get("image_feat")
+            sig = str(p.get("image_sig") or "")
+            if not isinstance(feat, list) or len(feat) < 3:
                 continue
             if sig and query_sig and sig == query_sig:
                 exact_hits.append(p)
                 continue
             dist = _feature_distance(query_feat, feat)
             scored.append((dist, p))
-            if p.get("id") and not p.get("image_feat"):
+        except Exception:
+            continue
+
+    # 2) Feature yo'qlar — eng mashhurlaridan hisobla (qolgan vaqt)
+    need_compute = []
+    try:
+        need_compute = await (
+            db.products.find(
+                {
+                    **PRODUCT_FILTER,
+                    "$or": [
+                        {"image_feat": {"$exists": False}},
+                        {"image_feat": None},
+                    ],
+                }
+            )
+            .sort([("sold", -1), ("pinned", -1)])
+            .limit(80)
+            .max_time_ms(4000)
+            .to_list(80)
+        )
+    except Exception as e:
+        logger.warning("search need_compute: %s", e)
+
+    to_persist = []
+    for p in need_compute:
+        if time.time() - t0 > TIME_BUDGET:
+            break
+        try:
+            feat, sig = _feat_from_product(p)
+            if not feat:
+                ref = _first_image_ref(p)
+                if ref and (ref.startswith("http://") or ref.startswith("https://")):
+                    # HTTP keyinroq
+                    continue
+                continue
+            if sig and query_sig and sig == query_sig:
+                exact_hits.append(p)
+                continue
+            dist = _feature_distance(query_feat, feat)
+            scored.append((dist, p))
+            if p.get("id"):
                 to_persist.append((p["id"], feat, sig))
         except Exception:
             continue
 
-    # Bir nechta HTTP rasmni parallel yuklash (qolgan vaqt ichida)
+    # HTTP rasmlar (qisqa)
     remain = TIME_BUDGET - (time.time() - t0)
-    if need_http and remain > 0.4:
+    http_need = []
+    for p in need_compute:
+        if p.get("id") and any(x[1].get("id") == p.get("id") for x in scored):
+            continue
+        ref = _first_image_ref(p)
+        if ref and (ref.startswith("http://") or ref.startswith("https://")):
+            http_need.append((p, ref))
+    if http_need and remain > 0.5:
         import httpx
-        sem = asyncio.Semaphore(6)
+        sem = asyncio.Semaphore(8)
 
         async def fetch_one(p, ref):
             try:
                 async with sem:
-                    async with httpx.AsyncClient(timeout=min(1.2, remain), follow_redirects=True) as c:
+                    async with httpx.AsyncClient(timeout=min(1.0, remain), follow_redirects=True) as c:
                         r = await c.get(ref)
                         if r.status_code != 200 or not r.content:
                             return None
@@ -1287,7 +1346,7 @@ async def search_by_image(image: UploadFile = File(...)):
                 return None
 
         http_results = await asyncio.gather(
-            *[fetch_one(p, ref) for p, ref in need_http[:20]],
+            *[fetch_one(p, ref) for p, ref in http_need[:25]],
             return_exceptions=True,
         )
         for r in http_results:
@@ -1298,31 +1357,53 @@ async def search_by_image(image: UploadFile = File(...)):
                 exact_hits.append(p)
             else:
                 scored.append((_feature_distance(query_feat, feat), p))
-                if p.get("id") and not p.get("image_feat"):
+                if p.get("id"):
                     to_persist.append((p["id"], feat, sig))
 
     if to_persist:
-        asyncio.create_task(_persist_image_feats(to_persist[:40]))
+        asyncio.create_task(_persist_image_feats(to_persist[:60]))
 
+    # Aniq moslik — eng yuqori prioritet
     if exact_hits:
+        # unique by id
+        seen = set()
+        uniq = []
+        for p in exact_hits:
+            pid = p.get("id")
+            if pid in seen:
+                continue
+            seen.add(pid)
+            uniq.append(p)
         return {
-            "items": [_visual_search_out(p) for p in exact_hits[:12]],
+            "items": [_visual_search_out(p) for p in uniq[:24]],
             "exact": True,
             "took_ms": int((time.time() - t0) * 1000),
         }
 
     if scored:
-        scored.sort(key=lambda x: x[0])
-        top = [p for _, p in scored[:24]]
+        # eng yaqin BIRINCHI (dist o'sish tartibida)
+        scored.sort(key=lambda x: (x[0], -int((x[1] or {}).get("sold") or 0)))
+        seen = set()
+        top = []
+        for dist, p in scored:
+            pid = p.get("id")
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            top.append(p)
+            if len(top) >= 24:
+                break
         return {
             "items": [_visual_search_out(p) for p in top],
             "exact": False,
             "took_ms": int((time.time() - t0) * 1000),
+            "best_dist": round(float(scored[0][0]), 4) if scored else None,
         }
 
-    # Hech qanday feature o'qilmasa — mashhur mahsulotlarni qaytaramiz (bo'sh UI bo'lmasin)
+    # Fallback — faqat hech narsa score bo'lmasa
+    fallback = precomputed or need_compute or []
     popular = sorted(
-        candidates,
+        fallback,
         key=lambda x: (-int(x.get("sold") or 0), -float(x.get("rating") or 0)),
     )[:20]
     return {
@@ -1631,76 +1712,200 @@ def admin_dashboard_cutoff(settings: Optional[dict] = None):
     return dt
 
 
+
+async def _product_first_image(p: dict) -> str:
+    if not p:
+        return ""
+    imgs = p.get("images")
+    if isinstance(imgs, list) and imgs:
+        x = imgs[0]
+        if isinstance(x, str) and x.strip():
+            return x.strip()
+        if isinstance(x, dict):
+            for k in ("url", "image", "src", "uri"):
+                if x.get(k):
+                    return str(x[k]).strip()
+    for k in ("image", "preview_image", "main_image"):
+        v = p.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
 async def build_replacement_candidates_for_item(item: dict, seller_id: str):
-    original_product = await db.products.find_one({"id": item.get("product_id")}, {"_id": 0, "category_id": 1, "name": 1})
-    category_id = original_product.get("category_id") if original_product else None
-    query = {"status": "approved", "hidden": {"$ne": True}, "stock": {"$gt": 0}, "seller_id": {"$ne": seller_id}}
+    """Boshqa sotuvchilardan o'xshash (nom + kategoriya) mahsulotlar — rasm bilan."""
+    original_product = await db.products.find_one(
+        {"id": item.get("product_id")},
+        {"_id": 0, "category_id": 1, "name": 1, "images": 1},
+    )
+    category_id = (original_product or {}).get("category_id")
+    query = {
+        "status": "approved",
+        "hidden": {"$ne": True},
+        "stock": {"$gt": 0},
+        "seller_id": {"$ne": seller_id},
+        "id": {"$ne": item.get("product_id")},
+    }
     if category_id:
         query["category_id"] = category_id
-    # limit scan tightly
-    products = await db.products.find(query, {"_id": 0}).limit(40).to_list(40)
+    products = await db.products.find(query, {"_id": 0}).limit(50).to_list(50)
+    # kategoriya bo'sh bo'lsa — umumiy qidiruv
+    if not products:
+        products = await db.products.find(
+            {
+                "status": "approved",
+                "hidden": {"$ne": True},
+                "stock": {"$gt": 0},
+                "seller_id": {"$ne": seller_id},
+                "id": {"$ne": item.get("product_id")},
+            },
+            {"_id": 0},
+        ).sort([("sold", -1)]).limit(30).to_list(30)
     if not products:
         return []
     original_name = item_name(item).lower()
     seller_ids = list({p.get("seller_id") for p in products if p.get("seller_id")})
-    sellers = await db.users.find({"id": {"$in": seller_ids}}, {"_id": 0, "id": 1, "first_name": 1, "seller_info": 1}).to_list(len(seller_ids) or 1)
+    sellers = await db.users.find(
+        {"id": {"$in": seller_ids}},
+        {"_id": 0, "id": 1, "first_name": 1, "seller_info": 1},
+    ).to_list(len(seller_ids) or 1)
     seller_map = {s["id"]: s for s in sellers}
     ranked = []
     for p in products:
         try:
             out = product_out(p)
-            name_uz = ((p.get("name") or {}) if isinstance(p.get("name"), dict) else {}).get("uz", "") or ""
+            name_uz = ""
+            nm = p.get("name")
+            if isinstance(nm, dict):
+                name_uz = str(nm.get("uz") or nm.get("ru") or nm.get("en") or "")
+            else:
+                name_uz = str(nm or "")
             similarity = difflib.SequenceMatcher(None, original_name, name_uz.lower()).ratio()
             seller = seller_map.get(p.get("seller_id"))
+            img = await _product_first_image(p)
+            # list_out ba'zan rasmni qisqartiradi — shu yerda to'liq birinchi rasm
             ranked.append({
                 "id": p["id"],
                 "product_id": p["id"],
                 "name": p.get("name"),
-                "image": (p.get("images") or [""])[0] if isinstance(p.get("images"), list) else "",
+                "image": img,
                 "price": float(out.get("display_price", out.get("effective_price", p.get("price", 0))) or 0),
                 "seller_price": float(out.get("seller_display_price", out.get("seller_effective_price", p.get("price", 0))) or 0),
-                "stock": int(out.get("display_stock", p.get("stock", 0)) or 0),
+                "stock": int(out.get("stock_total_units", out.get("display_stock", p.get("stock", 0))) or 0),
                 "sale_mode": out.get("sale_mode", "piece"),
                 "units_per_box": int(out.get("units_per_box", 0) or 0),
                 "seller_id": p.get("seller_id"),
-                "seller_name": ((seller.get("seller_info") or {}).get("shop_name") or seller.get("first_name") or "Do'kon") if seller else "Do'kon",
+                "seller_name": (
+                    ((seller.get("seller_info") or {}).get("shop_name") or seller.get("first_name") or "Do'kon")
+                    if seller else "Do'kon"
+                ),
                 "score": similarity,
             })
         except Exception:
             continue
     ranked.sort(key=lambda x: (-x["score"], x["price"]))
-    return ranked[:8]
+    return ranked[:10]
 
 
-async def build_rejected_order_payload(order: dict):
+async def _enrich_order_item_image(item: dict) -> dict:
+    """Rad etilgan itemda rasm yo'q bo'lsa — product dan to'ldirish."""
+    it = dict(item or {})
+    img = it.get("image")
+    if isinstance(img, str) and len(img.strip()) > 10:
+        return it
+    pid = it.get("product_id")
+    if not pid:
+        return it
+    prod = await db.products.find_one({"id": pid}, {"_id": 0, "images": 1, "image": 1, "preview_image": 1, "name": 1})
+    if prod:
+        it["image"] = await _product_first_image(prod)
+        if not it.get("name") and prod.get("name"):
+            it["name"] = prod.get("name")
+    return it
+
+
+async def build_rejected_order_payload(order: dict, only_rejected_items: bool = False):
     payload = {k: v for k, v in order.items() if k != "_id"}
     seller = await db.users.find_one({"id": order.get("seller_id")}, {"_id": 0})
     payload["rejected_seller"] = {
         "id": seller.get("id") if seller else order.get("seller_id"),
-        "name": (seller.get("seller_info") or {}).get("shop_name", f"{seller.get('first_name', '')} {seller.get('last_name', '')}".strip()) if seller else order.get("seller_id"),
+        "name": (
+            (seller.get("seller_info") or {}).get(
+                "shop_name",
+                f"{seller.get('first_name', '')} {seller.get('last_name', '')}".strip(),
+            )
+            if seller else order.get("seller_id")
+        ),
         "phone": seller.get("phone", "") if seller else "",
     }
+
+    items = list(order.get("items") or [])
+    if only_rejected_items:
+        # qisman rad: faqat rad etilgan qatorlar
+        rejected_rows = list(order.get("seller_rejected_items") or [])
+        if rejected_rows:
+            items = rejected_rows
+        else:
+            items = [it for it in items if it.get("seller_status") == "rejected"]
+
     payload["replacement_options"] = []
-    for idx, item in enumerate(order.get("items") or []):
+    for idx, item in enumerate(items):
+        enriched = await _enrich_order_item_image(item)
+        # item_index: asl buyurtmadagi index
+        original_idx = item.get("item_index")
+        if original_idx is None:
+            # to'liq rad: tartib bo'yicha
+            if only_rejected_items:
+                # try match by product_id in order items
+                original_idx = idx
+                for j, oi in enumerate(order.get("items") or []):
+                    if oi.get("product_id") == item.get("product_id"):
+                        original_idx = j
+                        break
+            else:
+                original_idx = idx
         payload["replacement_options"].append({
-            "item_index": idx,
-            "original_item": item,
-            "similar_products": await build_replacement_candidates_for_item(item, order.get("seller_id")),
+            "item_index": int(original_idx),
+            "original_item": enriched,
+            "similar_products": await build_replacement_candidates_for_item(
+                enriched, order.get("seller_id")
+            ),
         })
+
     deadline = parse_iso_dt((order.get("seller_rejection") or {}).get("reminder_due_at"))
-    payload["admin_reminder_due_in_minutes"] = max(0, int((deadline - now()).total_seconds() // 60)) if deadline else None
+    payload["admin_reminder_due_in_minutes"] = (
+        max(0, int((deadline - now()).total_seconds() // 60)) if deadline else None
+    )
+    payload["reject_mode"] = "partial" if only_rejected_items and order.get("status") != "seller_rejected" else "full"
     return payload
 
 
 async def reassign_rejected_order(order: dict, req: ResolveRejectedOrderReq, admin_user: dict):
-    if order.get("status") != "seller_rejected":
+    is_full = order.get("status") == "seller_rejected"
+    is_partial = bool(order.get("seller_rejected_items"))
+    if not is_full and not is_partial:
         raise HTTPException(400, "Buyurtma hali sotuvchi tomonidan rad etilmagan")
     items = order.get("items") or []
     if not items:
         raise HTTPException(400, "Buyurtmada mahsulot topilmadi")
     replacement_map = {int(r.item_index): r.product_id for r in (req.replacements or [])}
-    if len(replacement_map) != len(items):
-        raise HTTPException(400, "Har bir mahsulot uchun almashtirish tanlang")
+    # To'liq rad: barcha itemlar; qisman: faqat rad etilgan indexlar
+    if is_full:
+        if len(replacement_map) != len(items):
+            raise HTTPException(400, "Har bir mahsulot uchun almashtirish tanlang")
+    else:
+        rejected_idxs = set()
+        for it in (order.get("seller_rejected_items") or []):
+            if it.get("item_index") is not None:
+                rejected_idxs.add(int(it["item_index"]))
+        if not rejected_idxs:
+            for j, it in enumerate(items):
+                if it.get("seller_status") == "rejected":
+                    rejected_idxs.add(j)
+        if not rejected_idxs:
+            raise HTTPException(400, "Rad etilgan mahsulot topilmadi")
+        if set(replacement_map.keys()) != rejected_idxs:
+            raise HTTPException(400, "Har bir rad etilgan mahsulot uchun almashtirish tanlang")
 
     new_items = []
     seller_ids = set()
@@ -1709,28 +1914,59 @@ async def reassign_rejected_order(order: dict, req: ResolveRejectedOrderReq, adm
 
     for idx, old_item in enumerate(items):
         pid = replacement_map.get(idx)
+        if pid is None:
+            # qisman rad: o'zgarmagan (qabul qilingan) qator
+            qty = int(old_item.get("qty", 0) or 0)
+            price = float(old_item.get("price", 0) or 0)
+            base = float(old_item.get("base_price", price) or 0)
+            new_items.append(dict(old_item))
+            if old_item.get("seller_id"):
+                seller_ids.add(old_item.get("seller_id"))
+            else:
+                seller_ids.add(order.get("seller_id"))
+            new_subtotal += price * qty
+            new_seller_subtotal += base * qty
+            continue
         product = await db.products.find_one({"id": pid, "status": "approved"}, {"_id": 0})
         if not product or product.get("hidden"):
             raise HTTPException(404, "Tanlangan o'xshash mahsulot topilmadi")
         out = product_out(product)
         qty = int(old_item.get("qty", 0) or 0)
-        sale_units = int(out.get("sale_units") or 1)
+        # dona/quti: buyurtma variationiga qarab
+        variation = str(old_item.get("variation") or "").lower()
+        upb = int(out.get("units_per_box") or 0)
+        if "quti" in variation and upb > 0:
+            sale_units = upb
+        else:
+            sale_units = 1
         ordered_units = qty * sale_units
         if int(product.get("stock", 0) or 0) < ordered_units:
-            raise HTTPException(400, f"{product['name']['uz']}: omborda yetarli emas")
+            name_uz = (product.get("name") or {})
+            if isinstance(name_uz, dict):
+                name_uz = name_uz.get("uz") or "Mahsulot"
+            raise HTTPException(400, f"{name_uz}: omborda yetarli emas")
         seller_ids.add(product["seller_id"])
-        new_price = float(out.get("display_price", out.get("effective_price", product.get("price", 0))) or 0)
-        new_base_price = float(out.get("seller_display_price", out.get("seller_effective_price", product.get("price", 0))) or 0)
+        new_price = float(out.get("piece_price") or out.get("effective_price") or product.get("price") or 0)
+        if "quti" in variation and upb > 0:
+            new_price = float(out.get("effective_box_price") or new_price * upb)
+        new_base_price = float(out.get("seller_effective_price") or product.get("price") or 0)
+        if "quti" in variation and upb > 0:
+            new_base_price = float(out.get("seller_effective_box_price") or new_base_price * upb)
+        img = ""
+        imgs = product.get("images") or []
+        if isinstance(imgs, list) and imgs:
+            img = imgs[0] if isinstance(imgs[0], str) else ""
         new_items.append({
             **old_item,
             "product_id": product["id"],
             "name": product.get("name"),
-            "image": (product.get("images") or [old_item.get("image", "")])[0],
+            "image": img or old_item.get("image", ""),
             "price": new_price,
             "base_price": new_base_price,
             "sale_mode": out.get("sale_mode", "piece"),
-            "units_per_box": int(out.get("units_per_box", 0) or 0),
+            "units_per_box": upb,
             "ordered_units": ordered_units,
+            "seller_status": "accepted",
             "delivery_status": "pending",
             "replacement_from": {
                 "product_id": old_item.get("product_id"),
@@ -1777,6 +2013,8 @@ async def reassign_rejected_order(order: dict, req: ResolveRejectedOrderReq, adm
             "status": "packing",
             "delivery_eta_days": eta_days,
             "seller_rejection.resolved_at": iso(),
+            "seller_rejected_items": [],
+            "status": "confirmed",
             "seller_rejection.resolved_by": admin_user.get("id"),
             "seller_rejection.resolution_note": note,
             "replacement_summary": replacement_summary,
@@ -2277,6 +2515,7 @@ async def seller_order_action(oid: str, req: ActionReq, user=Depends(get_seller)
                 row = dict(it)
                 if act == "reject":
                     row["seller_status"] = "rejected"
+                    row["item_index"] = idx
                     units = order_reset_units(row)
                     await db.products.update_one(
                         {"id": row["product_id"]},
@@ -3490,30 +3729,49 @@ async def admin_order_eta(oid: str, req: EtaReq, user=Depends(get_admin)):
 
 @api_router.get("/admin/rejected-orders")
 async def admin_rejected_orders(user=Depends(get_admin)):
+    """To'liq rad (seller_rejected) + qisman rad (seller_rejected_items)."""
     try:
-        orders = await (
+        full = await (
             db.orders.find({"status": "seller_rejected"}, {"_id": 0})
             .sort("created_at", -1)
             .limit(50)
-            .max_time_ms(10000)
             .to_list(50)
         )
-        if not orders:
-            return []
-        results = await asyncio.gather(
-            *[build_rejected_order_payload(o) for o in orders],
-            return_exceptions=True,
+        partial = await (
+            db.orders.find(
+                {
+                    "status": {"$ne": "seller_rejected"},
+                    "seller_rejected_items.0": {"$exists": True},
+                    "seller_rejection.resolved_at": {"$exists": False},
+                },
+                {"_id": 0},
+            )
+            .sort("created_at", -1)
+            .limit(50)
+            .to_list(50)
         )
-        out = []
-        for r in results:
-            if isinstance(r, Exception):
-                logger.exception("rejected order payload failed: %s", r)
+        result = []
+        seen = set()
+        for o in full:
+            oid = o.get("id")
+            if oid in seen:
                 continue
-            out.append(json_safe(r))
-        return out
+            seen.add(oid)
+            result.append(await build_rejected_order_payload(o, only_rejected_items=False))
+        for o in partial:
+            oid = o.get("id")
+            if oid in seen:
+                continue
+            seen.add(oid)
+            # qisman: faqat rad etilganlar
+            payload = await build_rejected_order_payload(o, only_rejected_items=True)
+            if payload.get("replacement_options"):
+                result.append(payload)
+        return json_safe(result)
     except Exception as e:
         logger.exception("admin_rejected_orders failed: %s", e)
         return []
+
 
 
 @api_router.post("/admin/rejected-orders/{oid}/resolve")
