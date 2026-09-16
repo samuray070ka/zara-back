@@ -89,6 +89,56 @@ def now():
     return datetime.now(timezone.utc)
 
 
+
+def local_day_key(ts=None) -> str:
+    """Toshkent kuni (UTC+5) YYYY-MM-DD — bugungi statistika uchun."""
+    if ts is None:
+        dt = now() + timedelta(hours=5)
+    elif isinstance(ts, datetime):
+        dt = ts
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc) + timedelta(hours=5)
+    else:
+        s = str(ts or "")
+        try:
+            raw = s.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.astimezone(timezone.utc) + timedelta(hours=5)
+        except Exception:
+            return s[:10] if len(s) >= 10 else ""
+    return f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}"
+
+
+def order_seller_amount(o: dict) -> float:
+    """Sotuvchi aylanmasi: seller_subtotal → earn_total → items → subtotal."""
+    for key in ("seller_subtotal", "earn_total", "seller_total"):
+        v = o.get(key)
+        if v is not None:
+            try:
+                f = float(v)
+                if f > 0 or v == 0 or v == 0.0:
+                    return f
+            except Exception:
+                pass
+    total = 0.0
+    for i in (o.get("items") or []):
+        try:
+            unit = float(i.get("base_price") or i.get("earn") or i.get("seller_price") or i.get("price") or 0)
+            qty = float(i.get("qty") or 0)
+            total += unit * qty
+        except Exception:
+            continue
+    if total > 0:
+        return total
+    try:
+        return float(o.get("subtotal") or 0)
+    except Exception:
+        return 0.0
+
+
 def iso(dt=None):
     return (dt or now()).isoformat()
 
@@ -1700,7 +1750,14 @@ def can_courier_cancel(order: dict) -> bool:
     if order.get("status") != "courier" or not order.get("courier_id"):
         return False
     deadline = courier_cancel_deadline(order)
-    return bool(deadline and now() <= deadline)
+    if deadline is None:
+        # status_history da courier vaqti yo'q bo'lsa ham 1 soat beramiz (created_at dan)
+        created = parse_iso_dt(order.get("created_at"))
+        if created:
+            deadline = created + timedelta(hours=1)
+        else:
+            return True
+    return now() <= deadline
 
 
 def admin_dashboard_cutoff(settings: Optional[dict] = None):
@@ -2045,9 +2102,9 @@ def returned_item_amount(order: dict) -> float:
 
 
 def seller_today_snapshot(user: dict, orders: Optional[List[dict]] = None):
-    si = user.get("seller_info", {})
+    si = user.get("seller_info", {}) or {}
     orders = orders if orders is not None else []
-    today = iso()[:10]
+    today = local_day_key()
     reset_at = parse_iso_dt(si.get("stats_reset_at"))
 
     def after_reset(ts: Optional[str]) -> bool:
@@ -2058,8 +2115,14 @@ def seller_today_snapshot(user: dict, orders: Optional[List[dict]] = None):
 
     todays = []
     for o in orders:
-        created_ts = o.get("created_at") or status_at(o, "new")
-        if (created_ts or "")[:10] != today:
+        if not o:
+            continue
+        # bekor / to'liq rad etilganlarni aylanmaga kiritmaymiz
+        st = o.get("status") or ""
+        if st in ("cancelled", "seller_rejected"):
+            continue
+        created_ts = o.get("created_at") or status_at(o, "new") or ""
+        if local_day_key(created_ts) != today:
             continue
         if not after_reset(created_ts):
             continue
@@ -2067,20 +2130,20 @@ def seller_today_snapshot(user: dict, orders: Optional[List[dict]] = None):
 
     return {
         "today_orders": len(todays),
-        "today_amount": sum(float(o.get("seller_subtotal", 0) or 0) for o in todays),
+        "today_amount": sum(order_seller_amount(o) for o in todays),
         "today_returns_count": sum(1 for o in todays if (o.get("returned_items_count") or returned_item_qty(o)) > 0),
         "today_returns_amount": sum(returned_item_amount(o) for o in todays),
         "stats_reset_at": si.get("stats_reset_at"),
         "today_orders_list": [
             {
-                "id": o["id"],
-                "number": o["number"],
+                "id": o.get("id"),
+                "number": o.get("number"),
                 "status": o.get("status"),
                 "created_at": o.get("created_at"),
-                "amount": float(o.get("seller_subtotal", 0) or 0),
+                "amount": order_seller_amount(o),
                 "returned_items_count": o.get("returned_items_count") or returned_item_qty(o),
             }
-            for o in sorted(todays, key=lambda x: x.get("created_at", ""), reverse=True)[:20]
+            for o in sorted(todays, key=lambda x: x.get("created_at") or "", reverse=True)[:30]
         ],
     }
 
@@ -2269,6 +2332,65 @@ async def get_seller(user=Depends(get_user)):
     if not si or not si.get("approved"):
         raise HTTPException(403, "Sotuvchi tasdiqlanmagan")
     return user
+
+
+
+
+@api_router.post("/seller/search/by-image")
+async def seller_search_by_image(image: UploadFile = File(...), user=Depends(get_seller)):
+    """Faqat shu sotuvchining mahsulotlari orasidan rasm bo'yicha qidiruv."""
+    t0 = time.time()
+    try:
+        data = await image.read()
+    except Exception:
+        raise HTTPException(400, "Rasm o'qilmadi")
+    if not data or len(data) < 24:
+        raise HTTPException(400, "Rasm bo'sh")
+    data = _shrink_bytes(data, max_side=512)
+    query_sig = _image_signature(data)
+    query_feat = _image_features_from_bytes(data)
+
+    my_products = await (
+        db.products.find(
+            {"seller_id": user["id"], "status": {"$ne": "deleted"}},
+            {"_id": 0},
+        )
+        .limit(200)
+        .to_list(200)
+    )
+
+    exact = []
+    scored = []
+    for p in my_products:
+        try:
+            feat = p.get("image_feat")
+            sig = str(p.get("image_sig") or "")
+            if not isinstance(feat, list) or len(feat) < 3:
+                feat, sig = _feat_from_product(p)
+            if not feat:
+                continue
+            if sig and query_sig and sig == query_sig:
+                exact.append(p)
+                continue
+            scored.append((_feature_distance(query_feat, feat), p))
+        except Exception:
+            continue
+
+    if exact:
+        return {
+            "items": [_visual_search_out(p) for p in exact[:20]],
+            "exact": True,
+            "scope": "seller",
+            "took_ms": int((time.time() - t0) * 1000),
+        }
+    scored.sort(key=lambda x: x[0])
+    top = [p for _, p in scored[:20]]
+    return {
+        "items": [_visual_search_out(p) for p in top],
+        "exact": False,
+        "scope": "seller",
+        "took_ms": int((time.time() - t0) * 1000),
+    }
 
 
 @api_router.get("/seller/products")
@@ -2665,17 +2787,18 @@ async def seller_payment_received(oid: str, user=Depends(get_seller)):
 @api_router.get("/seller/stats")
 async def seller_stats(user=Depends(get_seller)):
     try:
-        today = iso()[:10]
-        # Only today's orders for snapshot — tiny
+        day_start = (now() - timedelta(hours=36)).isoformat()
         orders = await (
             db.orders.find(
-                {"seller_id": user["id"], "created_at": {"$gte": today}},
+                {"seller_id": user["id"], "created_at": {"$gte": day_start}},
                 {"_id": 0, "id": 1, "number": 1, "status": 1, "created_at": 1,
-                 "seller_subtotal": 1, "total": 1, "returned_items_count": 1,
-                 "items.qty": 1, "items.delivery_status": 1, "items.price": 1, "items.base_price": 1},
+                 "seller_subtotal": 1, "earn_total": 1, "subtotal": 1, "total": 1,
+                 "returned_items_count": 1, "status_history": 1,
+                 "items.qty": 1, "items.delivery_status": 1, "items.price": 1,
+                 "items.base_price": 1, "items.earn": 1, "items.seller_price": 1},
             )
             .max_time_ms(8000)
-            .to_list(200)
+            .to_list(300)
         )
         snap = seller_today_snapshot(user, orders)
         # Top products without images
@@ -2891,23 +3014,41 @@ async def courier_me_flags(user=Depends(get_courier)):
 
 @api_router.post("/courier/orders/{oid}/cancel")
 async def courier_cancel_taken_order(oid: str, user=Depends(get_courier)):
+    """Kuryer qabulni bekor qiladi → packing + courier_id=None; statistika qayta hisoblanadi."""
     o = await db.orders.find_one({"id": oid, "courier_id": user["id"]}, {"_id": 0})
     if not o:
-        raise HTTPException(404, "Topilmadi")
+        raise HTTPException(404, "Buyurtma topilmadi yoki sizga biriktirilmagan")
+    if o.get("status") != "courier":
+        raise HTTPException(400, "Faqat kuryerda turgan buyurtmani bekor qilish mumkin")
     if not can_courier_cancel(o):
-        raise HTTPException(400, "Bekor qilish faqat 1 soat ichida mumkin")
+        raise HTTPException(400, "Bekor qilish muddati tugagan (1 soat)")
+    # packing ga qaytarish — hub-check saqlanadi, oddiy kuryerlar yana oladi
     await db.orders.update_one(
-        {"id": oid},
+        {"id": oid, "courier_id": user["id"]},
         {
-            "$set": {"courier_id": None, "status": "packing"},
-            "$push": {"status_history": {"status": "packing", "at": iso(), "note": "Kuryer 1 soat ichida bekor qildi"}},
+            "$set": {
+                "courier_id": None,
+                "status": "packing",
+            },
+            "$unset": {"courier_accepted_at": ""},
+            "$push": {
+                "status_history": {
+                    "status": "packing",
+                    "at": iso(),
+                    "note": f"Kuryer qabulni bekor qildi ({user.get('phone') or user.get('id')})",
+                }
+            },
         },
     )
-    await notify(o["client_id"], f"Buyurtma {o['number']}", "Kuryer buyurtmani bekor qildi. Yangi kuryer tayinlanadi")
-    admins = await db.users.find({"role": "admin"}, {"_id": 0}).to_list(20)
-    for admin_u in admins:
-        await notify(admin_u["id"], "Kuryer buyurtmani qaytardi", f"{o['number']} yana bo'shatildi")
-    return {"ok": True}
+    try:
+        if o.get("client_id"):
+            await notify(o["client_id"], f"Buyurtma {o.get('number')}", "Kuryer buyurtmani qaytardi. Yangi kuryer tayinlanadi")
+        admins = await db.users.find({"role": "admin"}, {"_id": 0}).to_list(20)
+        for admin_u in admins:
+            await notify(admin_u["id"], "Kuryer buyurtmani qaytardi", f"{o.get('number')} yana bo'shatildi")
+    except Exception:
+        pass
+    return {"ok": True, "order_id": oid, "status": "packing"}
 
 
 @api_router.post("/courier/orders/{oid}/status")
@@ -3128,7 +3269,7 @@ async def admin_dashboard(user=Depends(get_admin)):
 
     # Only fields needed for stats — not full order docs
     proj = {"_id": 0, "created_at": 1, "status": 1, "total": 1, "items.product_id": 1, "items.base_price": 1, "items.price": 1, "items.qty": 1, "items.delivery_status": 1}
-    orders, products, clients, sellers, couriers_online, pending_products, pending_sellers = await asyncio.gather(
+    orders, products, clients, sellers, couriers_online, pending_products, pending_sellers, total_products, low_stock_count = await asyncio.gather(
         db.orders.find({}, proj).to_list(10000),
         db.products.find({"cost_price": {"$gt": 0}}, {"id": 1, "cost_price": 1, "_id": 0}).to_list(5000),
         db.users.count_documents({"role": "client"}),
@@ -3136,6 +3277,12 @@ async def admin_dashboard(user=Depends(get_admin)):
         db.users.count_documents({"role": "courier", "courier_info.online": True}),
         db.products.count_documents({"status": "pending"}),
         db.users.count_documents({"seller_info.approved": False, "seller_info.rejected": False, "seller_info": {"$exists": True}}),
+        db.products.count_documents({"status": {"$ne": "deleted"}}),
+        db.products.count_documents({
+            "status": {"$in": ["approved", "pending"]},
+            "hidden": {"$ne": True},
+            "stock": {"$gt": 0, "$lt": 10},
+        }),
     )
 
     def after_cutoff(order: dict) -> bool:
@@ -3185,10 +3332,77 @@ async def admin_dashboard(user=Depends(get_admin)):
         "sellers": sellers,
         "couriers_online": couriers_online,
         "pending_products": pending_products,
+        "total_products": total_products,
+        "low_stock_count": low_stock_count,
         "pending_sellers": pending_sellers,
         "new_orders": sum(1 for o in orders if o.get("status") == "new"),
         "dashboard_stats_reset_at": settings.get("dashboard_money_reset_at") or settings.get("dashboard_stats_reset_at"),
     }
+
+
+
+
+@api_router.get("/admin/products/low-stock")
+async def admin_low_stock_products(user=Depends(get_admin)):
+    """10 tadan kam dona qolgan mahsulotlar (rasm bilan)."""
+    try:
+        prods = await (
+            db.products.find(
+                {
+                    "status": {"$in": ["approved", "pending"]},
+                    "hidden": {"$ne": True},
+                    "stock": {"$gt": 0, "$lt": 10},
+                },
+                {
+                    "_id": 0,
+                    "id": 1,
+                    "name": 1,
+                    "images": 1,
+                    "image": 1,
+                    "stock": 1,
+                    "price": 1,
+                    "seller_id": 1,
+                    "status": 1,
+                    "units_per_box": 1,
+                    "unit_type": 1,
+                },
+            )
+            .sort("stock", 1)
+            .limit(100)
+            .to_list(100)
+        )
+        seller_ids = list({p.get("seller_id") for p in prods if p.get("seller_id")})
+        sellers = await db.users.find(
+            {"id": {"$in": seller_ids}},
+            {"_id": 0, "id": 1, "first_name": 1, "seller_info.shop_name": 1, "phone": 1},
+        ).to_list(len(seller_ids) or 1)
+        smap = {s["id"]: s for s in sellers}
+        items = []
+        for p in prods:
+            s = smap.get(p.get("seller_id")) or {}
+            si = s.get("seller_info") or {}
+            img = ""
+            imgs = p.get("images") or []
+            if isinstance(imgs, list) and imgs:
+                img = imgs[0] if isinstance(imgs[0], str) else (imgs[0].get("url") if isinstance(imgs[0], dict) else "")
+            if not img and isinstance(p.get("image"), str):
+                img = p["image"]
+            items.append({
+                "id": p.get("id"),
+                "name": p.get("name"),
+                "image": img,
+                "stock": int(p.get("stock") or 0),
+                "price": float(p.get("price") or 0),
+                "status": p.get("status"),
+                "units_per_box": int(p.get("units_per_box") or 0),
+                "unit_type": p.get("unit_type") or "piece",
+                "seller_name": si.get("shop_name") or s.get("first_name") or "—",
+                "seller_phone": s.get("phone") or "",
+            })
+        return json_safe({"items": items, "total": len(items)})
+    except Exception as e:
+        logger.exception("admin_low_stock: %s", e)
+        return {"items": [], "total": 0}
 
 
 @api_router.get("/admin/dashboard/history")
@@ -3301,18 +3515,20 @@ async def admin_users(role: Optional[str] = None, q: Optional[str] = None, user=
             ids = [u["id"] for u in users if u.get("id")]
             if not ids:
                 return []
-            today = iso()[:10]
-            # Only recent orders (today + last 2 days) for today-stats — tiny payload
+            # UTC+5 kuni — 2 kunlik oyna (UTC siljishiga barqaror)
+            day_start = (now() - timedelta(hours=36)).isoformat()
             all_orders = await (
                 db.orders.find(
-                    {"seller_id": {"$in": ids}, "created_at": {"$gte": today}},
+                    {"seller_id": {"$in": ids}, "created_at": {"$gte": day_start}},
                     {"_id": 0, "id": 1, "number": 1, "seller_id": 1, "status": 1, "total": 1,
-                     "seller_subtotal": 1, "created_at": 1, "client_name": 1,
+                     "subtotal": 1, "seller_subtotal": 1, "earn_total": 1, "created_at": 1,
+                     "client_name": 1, "returned_items_count": 1, "status_history": 1,
                      "items.product_id": 1, "items.name": 1, "items.qty": 1, "items.price": 1,
+                     "items.base_price": 1, "items.earn": 1, "items.seller_price": 1,
                      "items.delivery_status": 1},
                 )
-                .max_time_ms(10000)
-                .to_list(500)
+                .max_time_ms(12000)
+                .to_list(1000)
             )
             by_seller: Dict[str, List[dict]] = {}
             for o in all_orders:
