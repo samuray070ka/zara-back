@@ -1632,7 +1632,6 @@ async def my_orders(user=Depends(get_user)):
         return cached["data"]
 
     try:
-        # Lean projection — list page does not need every nested field
         proj = {
             "_id": 0,
             "id": 1,
@@ -1654,11 +1653,75 @@ async def my_orders(user=Depends(get_user)):
             "comment": 1,
             "promo_code": 1,
             "seller_id": 1,
+            "returned_items_count": 1,
+            "delivery_eta_days": 1,
         }
         raw = await db.orders.find(
             {"client_id": uid_key},
             proj,
         ).sort("created_at", -1).max_time_ms(8000).to_list(100)
+
+        # Ro'yxat uchun rasm: yo'q yoki juda katta base64 → product dan olish
+        need_pids = set()
+        for o in raw:
+            for it in (o.get("items") or [])[:6]:
+                img = it.get("image") if isinstance(it, dict) else ""
+                if not isinstance(img, str):
+                    img = ""
+                bad = (not img) or len(img) < 8 or (img.startswith("data:") and len(img) > 6000)
+                if bad and it.get("product_id"):
+                    need_pids.add(it["product_id"])
+
+        prod_img: Dict[str, str] = {}
+        if need_pids:
+            prods = await db.products.find(
+                {"id": {"$in": list(need_pids)}},
+                {"_id": 0, "id": 1, "images": 1, "image": 1, "preview_image": 1},
+            ).to_list(len(need_pids))
+            for p in prods:
+                try:
+                    out = product_list_out(dict(p))
+                    thumb = out.get("image") or out.get("preview_image") or ""
+                    if not thumb:
+                        imgs = out.get("images") or []
+                        if imgs and isinstance(imgs[0], str):
+                            thumb = imgs[0]
+                    if thumb:
+                        prod_img[p["id"]] = thumb
+                except Exception:
+                    # fallback raw first image
+                    imgs = p.get("images") or []
+                    if isinstance(imgs, list) and imgs and isinstance(imgs[0], str):
+                        prod_img[p["id"]] = imgs[0][:50000] if imgs[0].startswith("data:") else imgs[0]
+                    elif isinstance(p.get("image"), str):
+                        prod_img[p["id"]] = p["image"]
+
+        for o in raw:
+            items = o.get("items") or []
+            slim_items = []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                row = {
+                    "product_id": it.get("product_id"),
+                    "name": it.get("name"),
+                    "qty": it.get("qty"),
+                    "price": it.get("price"),
+                    "variation": it.get("variation"),
+                    "delivery_status": it.get("delivery_status"),
+                    "image": it.get("image") or "",
+                }
+                img = row["image"] if isinstance(row["image"], str) else ""
+                if (not img) or len(img) < 8 or (img.startswith("data:") and len(img) > 6000):
+                    pid = it.get("product_id")
+                    if pid and pid in prod_img:
+                        row["image"] = prod_img[pid]
+                    else:
+                        row["image"] = ""
+                # list UI uchun juda katta base64 ni qisqartirmasdan qoldiramiz agar product_list_out bergan bo'lsa
+                slim_items.append(row)
+            o["items"] = slim_items
+
         data = [json_safe(o) for o in raw]
         _MY_ORDERS_CACHE[uid_key] = {"data": data, "expires_at": now_ts + 15.0}
         if len(_MY_ORDERS_CACHE) > 200:
@@ -2155,10 +2218,51 @@ def courier_fee_for_order(order: dict) -> float:
     return float(order.get("original_delivery_fee", order.get("delivery_fee", 0)) or 0)
 
 
+def order_cash_to_handover(order: dict) -> float:
+    """
+    Kuryer mijozdan olgan va admin/do'konga topshiradigan summa.
+    - Yetkazilgan mahsulotlar narxi (mijoz narxi)
+    - + yetkazish haqi (mijoz to'lagan)
+    - - chegirma
+    - Qaytarilgan mahsulotlar KIRMAYDI
+    Kuryerning o'z haqi (daromad) bu yerga kirmaydi — bu to'liq inkasso summasi.
+    """
+    if not order:
+        return 0.0
+    # finalize dan keyin total allaqachon qaytarilganlarsiz
+    if order.get("status") == "delivered":
+        try:
+            return max(0.0, float(order.get("total") or 0))
+        except Exception:
+            return 0.0
+    items = order.get("items") or []
+    has_flag = any(i.get("delivery_status") for i in items)
+    goods = 0.0
+    for i in items:
+        st = i.get("delivery_status")
+        if has_flag and st == "returned":
+            continue
+        if has_flag and st and st != "delivered":
+            continue
+        goods += item_line_total(i)
+    try:
+        fee = float(order.get("delivery_fee") or 0)
+    except Exception:
+        fee = 0.0
+    try:
+        sub = float(order.get("subtotal") or order.get("original_subtotal") or 0)
+        disc = float(order.get("discount") or 0)
+        if sub > 0 and goods < sub:
+            disc = disc * (goods / sub)
+    except Exception:
+        disc = 0.0
+    return max(0.0, goods + fee - disc)
+
+
 async def build_courier_stats(user: dict, orders: Optional[List[dict]] = None):
-    ci = user.get("courier_info", {})
+    ci = user.get("courier_info", {}) or {}
     orders = orders if orders is not None else await db.orders.find({"courier_id": user["id"]}, {"_id": 0}).to_list(1000)
-    today = iso()[:10]
+    today = local_day_key() if "local_day_key" in globals() else iso()[:10]
     reset_at = parse_iso_dt(ci.get("stats_reset_at"))
 
     def after_reset(ts: Optional[str]) -> bool:
@@ -2168,17 +2272,48 @@ async def build_courier_stats(user: dict, orders: Optional[List[dict]] = None):
         return bool(dt and dt >= reset_at)
 
     active_orders = [o for o in orders if o.get("status") == "courier"]
-    taken_today = [o for o in orders if (status_at(o, "courier") or "")[:10] == today]
-    delivered_today = [o for o in orders if (status_at(o, "delivered") or "")[:10] == today]
-    delivered_since_reset = [o for o in orders if status_at(o, "delivered") and after_reset(status_at(o, "delivered"))]
+    taken_today = []
+    for o in orders:
+        ts = status_at(o, "courier") or o.get("created_at") or ""
+        day = local_day_key(ts) if "local_day_key" in globals() else (ts or "")[:10]
+        if day == today:
+            taken_today.append(o)
+    delivered_today = []
+    delivered_since_reset = []
+    for o in orders:
+        dts = status_at(o, "delivered")
+        if not dts and o.get("status") != "delivered":
+            continue
+        if o.get("status") != "delivered" and not dts:
+            continue
+        # faqat yetkazilgan
+        if o.get("status") not in ("delivered",) and not dts:
+            continue
+        if o.get("status") == "delivered" or dts:
+            day = local_day_key(dts or o.get("created_at")) if "local_day_key" in globals() else (dts or "")[:10]
+            if day == today:
+                delivered_today.append(o)
+            if after_reset(dts or o.get("delivery_completed_at") or o.get("created_at")):
+                delivered_since_reset.append(o)
+
+    cash_reset = sum(order_cash_to_handover(o) for o in delivered_since_reset)
+    cash_today = sum(order_cash_to_handover(o) for o in delivered_today)
+    # kuryer shaxsiy haqi (admin panelda asosiy emas)
+    fee_reset = sum(courier_fee_for_order(o) for o in delivered_since_reset)
+    fee_today = sum(courier_fee_for_order(o) for o in delivered_today)
 
     return {
         "deliveries": len(delivered_since_reset),
-        "earnings": sum(courier_fee_for_order(o) for o in delivered_since_reset),
+        # asosiy: topshiriladigan inkasso (mijozdan olingan, qaytarilganlarsiz)
+        "cash_to_handover": cash_reset,
+        "earnings": cash_reset,  # admin UI "daromad" o'rniga inkasso ko'rsatadi
+        "courier_fee_earnings": fee_reset,
         "today_deliveries": len(delivered_today),
-        "today_earnings": sum(courier_fee_for_order(o) for o in delivered_today),
+        "today_cash_to_handover": cash_today,
+        "today_earnings": cash_today,
+        "today_courier_fee": fee_today,
         "today_taken_count": len(taken_today),
-        "today_taken_total": sum(float(o.get("total", 0) or 0) for o in taken_today),
+        "today_taken_total": sum(float(o.get("total", 0) or 0) for o in taken_today if o.get("status") == "courier"),
         "active_count": len(active_orders),
         "active_total": sum(float(o.get("total", 0) or 0) for o in active_orders),
         "online": ci.get("online", False),
@@ -3560,8 +3695,11 @@ async def admin_users(role: Optional[str] = None, q: Optional[str] = None, user=
                 db.orders.find(
                     {"courier_id": {"$in": ids}},
                     {"_id": 0, "id": 1, "number": 1, "courier_id": 1, "status": 1, "total": 1,
-                     "created_at": 1, "client_name": 1, "client_phone": 1,
-                     "status_history": 1, "items.qty": 1, "items.delivery_status": 1, "items.name": 1},
+                     "subtotal": 1, "delivery_fee": 1, "discount": 1, "delivered_subtotal": 1,
+                     "created_at": 1, "delivery_completed_at": 1, "client_name": 1, "client_phone": 1,
+                     "status_history": 1,
+                     "items.qty": 1, "items.price": 1, "items.base_price": 1,
+                     "items.delivery_status": 1, "items.name": 1},
                 )
                 .max_time_ms(10000)
                 .to_list(800)
