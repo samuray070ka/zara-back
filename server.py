@@ -271,6 +271,7 @@ class ProductReq(BaseModel):
     images: List[str] = []
     stock: int = 0
     variations: List[Dict[str, Any]] = []
+    unit_type: str = "piece"  # piece | kg
 
 
 class ItemDecisionReq(BaseModel):
@@ -278,11 +279,19 @@ class ItemDecisionReq(BaseModel):
     action: str  # accept | reject
 
 
+class KgExtraReq(BaseModel):
+    index: int
+    extra_qty: float = 0  # ortiqcha kg (yoki gram sifatida 0.05 = 50g)
+    extra_price: float = 0  # sotuvchi yozgan ortiqcha summa (sof)
+
+
 class ActionReq(BaseModel):
     action: str
     reason: Optional[str] = ""
     # partial accept: har bir mahsulot bo'yicha qaror
     items: Optional[List[ItemDecisionReq]] = None
+    # kg mahsulotlar uchun ortiqcha og'irlik (Yig'ildi paytida)
+    kg_extras: Optional[List[KgExtraReq]] = None
 
 
 class StatusReq(BaseModel):
@@ -342,6 +351,8 @@ class SettingsReq(BaseModel):
     contact: Optional[str] = None
     default_markup_percent: Optional[float] = None
     default_delivery_eta_days: Optional[int] = None
+    # Ortiqcha kg uchun moderator/admin foizi (sotuvchi yozgan summaga ustama)
+    kg_extra_markup_percent: Optional[float] = None
 
 
 class CourierCreateReq(BaseModel):
@@ -2547,7 +2558,7 @@ async def seller_products(user=Depends(get_seller)):
                 "preview_image": 1,
             }},
             {"$sort": {"created_at": -1}},
-            {"$limit": 150},
+            {"$limit": 100},
         ]
         raw = await db.products.aggregate(pipeline, maxTimeMS=12000, allowDiskUse=True).to_list(150)
         out = []
@@ -2590,9 +2601,9 @@ async def seller_add_product(req: ProductReq, user=Depends(get_seller)):
         "desc": {"uz": req.desc_uz, "ru": req.desc_ru or req.desc_uz, "en": req.desc_en or req.desc_uz},
         "category_id": req.category_id, "price": req.price, "old_price": req.old_price,
         "cost_price": req.cost_price or 0,
-        "box_price": None if str(getattr(req, "unit_type", "piece") or "piece").lower() == "kg" else req.box_price,
-        "units_per_box": 0 if str(getattr(req, "unit_type", "piece") or "piece").lower() == "kg" else max(int(req.units_per_box or 0), 0),
-        "unit_type": "kg" if str(getattr(req, "unit_type", "piece") or "piece").lower() == "kg" else "piece",
+        "box_price": None if str(req.unit_type or "piece").lower() == "kg" else req.box_price,
+        "units_per_box": 0 if str(req.unit_type or "piece").lower() == "kg" else max(int(req.units_per_box or 0), 0),
+        "unit_type": "kg" if str(req.unit_type or "piece").lower() == "kg" else "piece",
         "images": req.images or ["https://images.unsplash.com/photo-1553456558-aff63285bdd1?w=600&q=80"],
         "stock": req.stock, "variations": req.variations, "status": "pending", "hidden": False,
         "pinned": False, "rating": 0, "reviews_count": 0, "views": 0, "sold": 0, "created_at": iso(),
@@ -2611,9 +2622,9 @@ async def seller_edit_product(pid: str, req: ProductReq, user=Depends(get_seller
         "desc": {"uz": req.desc_uz, "ru": req.desc_ru or req.desc_uz, "en": req.desc_en or req.desc_uz},
         "category_id": req.category_id, "price": req.price, "old_price": req.old_price,
         "cost_price": req.cost_price if req.cost_price is not None else p.get("cost_price", 0),
-        "box_price": None if str(getattr(req, "unit_type", "piece") or "piece").lower() == "kg" else req.box_price,
-        "units_per_box": 0 if str(getattr(req, "unit_type", "piece") or "piece").lower() == "kg" else max(int(req.units_per_box or 0), 0),
-        "unit_type": "kg" if str(getattr(req, "unit_type", "piece") or "piece").lower() == "kg" else "piece",
+        "box_price": None if str(req.unit_type or "piece").lower() == "kg" else req.box_price,
+        "units_per_box": 0 if str(req.unit_type or "piece").lower() == "kg" else max(int(req.units_per_box or 0), 0),
+        "unit_type": "kg" if str(req.unit_type or "piece").lower() == "kg" else "piece",
         "stock": req.stock, "status": "pending",
     }
     if req.images:
@@ -2681,9 +2692,10 @@ async def seller_orders(user=Depends(get_seller)):
             {"$project": {
                 "_id": 0,
                 "id": 1, "number": 1, "status": 1, "created_at": 1,
-                "seller_subtotal": 1, "delivery_method": 1,
+                "seller_subtotal": 1, "delivery_method": 1, "total": 1, "subtotal": 1,
                 "has_returns": 1, "returned_items_count": 1, "delivered_items_count": 1,
                 "seller_payment_received_at": 1, "seller_payment_confirmed": 1,
+                "kg_extra_client_total": 1, "kg_extra_seller_total": 1, "kg_extra_markup_percent": 1,
                 "items.product_id": 1,
                 "items.name": 1,
                 "items.price": 1,
@@ -2691,11 +2703,49 @@ async def seller_orders(user=Depends(get_seller)):
                 "items.qty": 1,
                 "items.variation": 1,
                 "items.delivery_status": 1,
+                "items.sale_mode": 1,
+                "items.unit_type": 1,
+                "items.units_per_box": 1,
+                "items.extra_qty": 1,
+                "items.extra_seller_price": 1,
+                "items.extra_client_price": 1,
+                "items.extra_markup_percent": 1,
+                "items.extra_note": 1,
             }},
             {"$sort": {"created_at": -1}},
             {"$limit": 80},
         ]
         raw = await db.orders.aggregate(pipeline, maxTimeMS=12000, allowDiskUse=True).to_list(80)
+        # Har doim product.unit_type bo'yicha kg/dona ni aniqlash (eski buyurtmalar uchun ham)
+        need_pids = set()
+        for o in raw:
+            for it in (o.get("items") or []):
+                if it.get("product_id"):
+                    need_pids.add(it["product_id"])
+        prod_unit = {}
+        if need_pids:
+            prods = await db.products.find(
+                {"id": {"$in": list(need_pids)}},
+                {"_id": 0, "id": 1, "unit_type": 1},
+            ).to_list(len(need_pids))
+            for p in prods:
+                prod_unit[p["id"]] = str(p.get("unit_type") or "piece").lower()
+        for o in raw:
+            for it in (o.get("items") or []):
+                ut = str(it.get("unit_type") or "").lower()
+                sm = str(it.get("sale_mode") or "").lower()
+                if ut not in ("kg", "piece") or sm not in ("kg", "piece", "box"):
+                    ut = prod_unit.get(it.get("product_id") or "", ut or "piece")
+                if not ut:
+                    ut = prod_unit.get(it.get("product_id") or "", "piece")
+                it["unit_type"] = ut if ut in ("kg", "piece") else "piece"
+                if sm == "box":
+                    it["sale_mode"] = "box"
+                elif it["unit_type"] == "kg" or sm == "kg":
+                    it["sale_mode"] = "kg"
+                    it["unit_type"] = "kg"
+                else:
+                    it["sale_mode"] = sm if sm in ("piece", "box") else "piece"
         return [json_safe(seller_order_out(o)) for o in raw]
     except Exception as e:
         logger.exception("seller_orders failed: %s", e)
@@ -2704,10 +2754,10 @@ async def seller_orders(user=Depends(get_seller)):
                 db.orders.find(
                     {"seller_id": user["id"]},
                     {"_id": 0, "id": 1, "number": 1, "status": 1, "created_at": 1,
-                     "seller_subtotal": 1, "delivery_method": 1,
+                     "seller_subtotal": 1, "delivery_method": 1, "total": 1, "subtotal": 1,
                      "seller_payment_received_at": 1, "seller_payment_confirmed": 1,
-                     "items.product_id": 1, "items.name": 1, "items.price": 1,
-                     "items.base_price": 1, "items.qty": 1, "items.delivery_status": 1},
+                     "kg_extra_client_total": 1, "kg_extra_seller_total": 1,
+                     "items": 1},
                 )
                 .sort("created_at", -1)
                 .max_time_ms(10000)
@@ -2861,7 +2911,88 @@ async def seller_order_action(oid: str, req: ActionReq, user=Depends(get_seller)
     elif req.action == "reject" and o["status"] in ("new", "confirmed"):
         await _full_reject(o, req.reason or "Sotuvchi rad etdi")
     elif req.action == "packed" and o["status"] == "confirmed":
-        await set_order_status(o, "packing")
+        items = [dict(i) for i in (o.get("items") or [])]
+        extras_map = {}
+        if req.kg_extras:
+            for e in req.kg_extras:
+                try:
+                    extras_map[int(e.index)] = e
+                except Exception:
+                    pass
+        settings = await db.settings.find_one({"id": "main"}, {"_id": 0}) or {}
+        try:
+            pct = float(settings.get("kg_extra_markup_percent") if settings.get("kg_extra_markup_percent") is not None else 0)
+        except Exception:
+            pct = 0.0
+        extra_client_sum = 0.0
+        extra_seller_sum = 0.0
+        for idx, it in enumerate(items):
+            mode = str(it.get("sale_mode") or it.get("unit_type") or "piece").lower()
+            if mode != "kg":
+                continue
+            ex = extras_map.get(idx)
+            if not ex:
+                continue
+            try:
+                eq = float(ex.extra_qty or 0)
+            except Exception:
+                eq = 0.0
+            try:
+                ep = float(ex.extra_price or 0)
+            except Exception:
+                ep = 0.0
+            if eq <= 0 and ep <= 0:
+                continue
+            client_extra = round(ep * (1 + pct / 100.0)) if pct else round(ep)
+            it["extra_qty"] = eq
+            it["extra_unit"] = "kg"
+            it["extra_seller_price"] = ep
+            it["extra_markup_percent"] = pct
+            it["extra_client_price"] = client_extra
+            it["extra_note"] = f"Ortiqcha {eq} kg"
+            extra_client_sum += client_extra
+            extra_seller_sum += ep
+        set_fields = {
+            "status": "packing",
+            "items": items,
+        }
+        if extra_client_sum > 0 or extra_seller_sum > 0:
+            old_sub = float(o.get("subtotal") or 0)
+            old_seller_sub = float(o.get("seller_subtotal") or 0)
+            dfee = float(o.get("delivery_fee") or 0)
+            disc = float(o.get("discount") or 0)
+            new_sub = old_sub + extra_client_sum
+            new_seller_sub = old_seller_sub + extra_seller_sum
+            new_total = new_sub + dfee - disc
+            set_fields.update({
+                "subtotal": new_sub,
+                "seller_subtotal": new_seller_sub,
+                "total": new_total,
+                "kg_extra_client_total": extra_client_sum,
+                "kg_extra_seller_total": extra_seller_sum,
+                "kg_extra_markup_percent": pct,
+            })
+            # sotuvchi daromadi (earn_total) ham yangilansin
+            if o.get("earn_total") is not None:
+                try:
+                    set_fields["earn_total"] = float(o.get("earn_total") or 0) + extra_seller_sum
+                except Exception:
+                    pass
+        note = "Yig'ildi"
+        if extra_client_sum > 0:
+            note += f" • ortiqcha kg mijoz: {int(extra_client_sum):,} so'm"
+        await db.orders.update_one(
+            {"id": oid, "seller_id": user["id"]},
+            {
+                "$set": set_fields,
+                "$push": {"status_history": {"status": "packing", "at": iso(), "note": note}},
+            },
+        )
+        try:
+            await notify(o["client_id"], f"Buyurtma {o.get('number')}", "Buyurtma yig'ilmoqda" + (f". Ortiqcha og'irlik qo'shildi: {int(extra_client_sum):,} so'm" if extra_client_sum else ""))
+        except Exception:
+            pass
+        return {"ok": True, "kg_extra_client_total": extra_client_sum, "kg_extra_seller_total": extra_seller_sum}
     elif req.action == "payment_received" and o["status"] == "delivered":
         if not o.get("seller_payment_received_at"):
             paid_at = iso()
@@ -3009,8 +3140,24 @@ async def courier_apply(req: CourierApplyReq, user=Depends(get_user)):
     return public_user(u)
 
 
+def slim_order_items_for_courier(items):
+    """Kuryer ro'yxati uchun — base64 rasmlarni olib tashlash (tezlik)."""
+    out = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        row = {k: v for k, v in it.items() if k not in ("image", "images")}
+        img = it.get("image")
+        if isinstance(img, str) and (img.startswith("http://") or img.startswith("https://")) and len(img) < 500:
+            row["image"] = img
+        out.append(row)
+    return out
+
+
 async def order_with_route(o: dict):
     o = {k: v for k, v in o.items() if k != "_id"}
+    if isinstance(o.get("items"), list):
+        o["items"] = slim_order_items_for_courier(o["items"])
     seller = await db.users.find_one({"id": o["seller_id"]}, {"_id": 0})
     o["shop_name"] = seller.get("seller_info", {}).get("shop_name", "Do'kon") if seller else "Do'kon"
     o["shop_phone"] = seller.get("phone", "") if seller else ""
@@ -4276,6 +4423,7 @@ async def admin_set_settings(req: SettingsReq, user=Depends(get_admin)):
     s = await db.settings.find_one({"id": "main"}, {"_id": 0}) or {}
     SETTINGS_CACHE["default_markup_percent"] = s.get("default_markup_percent", 0) or 0
     SETTINGS_CACHE["default_delivery_eta_days"] = int(s.get("default_delivery_eta_days") or 0)
+    SETTINGS_CACHE["kg_extra_markup_percent"] = float(s.get("kg_extra_markup_percent") or 0)
     return json_safe(s)
 
 
@@ -4318,6 +4466,7 @@ async def public_settings():
         "work_hours": s.get("work_hours", "09:00 - 21:00"),
         "contact": s.get("contact", "+998 71 200 00 00"),
         "default_delivery_eta_days": int(s.get("default_delivery_eta_days") or 0),
+        "kg_extra_markup_percent": float(s.get("kg_extra_markup_percent") or 0),
     }
 
 
