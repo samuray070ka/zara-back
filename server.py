@@ -185,7 +185,8 @@ class VerifyOtpReq(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     language: Optional[str] = "uz"
-    address_text: Optional[str] = None  # ixtiyoriy taxminiy manzil
+    address_text: Optional[str] = None  # ixtiyoriy yozuv (chekda chiqadi)
+    profile_note: Optional[str] = None
 
 
 class ProfileReq(BaseModel):
@@ -492,12 +493,17 @@ async def verify_otp(req: VerifyOtpReq):
     is_new = user is None
     if is_new:
         addresses = []
-        addr_text = (req.address_text or "").strip() if getattr(req, "address_text", None) else ""
-        if addr_text:
+        note = (
+            (getattr(req, "profile_note", None) or req.address_text or "")
+            if True
+            else ""
+        )
+        note = str(note or "").strip()
+        if note:
             addresses.append({
                 "id": uid(),
-                "label": "Asosiy",
-                "text": addr_text,
+                "label": "Ixtiyoriy",
+                "text": note,
                 "lat": None,
                 "lng": None,
             })
@@ -506,7 +512,9 @@ async def verify_otp(req: VerifyOtpReq):
             "first_name": req.first_name or "Foydalanuvchi", "last_name": req.last_name or "",
             "role": "client", "language": req.language or "uz", "blocked": False,
             "referral_code": f"UZ{random.randint(10000, 99999)}",
-            "favorites": [], "addresses": addresses, "created_at": iso(),
+            "favorites": [], "addresses": addresses,
+            "profile_note": note,
+            "created_at": iso(),
         }
         await db.users.insert_one(dict(user))
     if user.get("blocked"):
@@ -1613,6 +1621,7 @@ async def create_order(req: OrderReq, user=Depends(get_user)):
             "delivery_method": req.delivery_method,
             "delivery_eta_days": default_eta_days if req.delivery_method == "courier" else 0,
             "payment_method": req.payment_method, "comment": req.comment, "courier_id": None,
+            "client_note": (user.get("profile_note") or "").strip() or None,
             "status_history": [{"status": "new", "at": iso()}], "created_at": iso(),
         }
         await db.orders.insert_one(dict(order))
@@ -1791,11 +1800,37 @@ def item_name(item: dict):
 
 
 def item_line_total(item: dict) -> float:
-    return float(item.get("price", 0) or 0) * int(item.get("qty", 0) or 0)
+    """Mijoz to'laydigan qator summasi (ortiqcha kg bilan)."""
+    try:
+        qty = float(item.get("qty", 0) or 0)
+    except (TypeError, ValueError):
+        qty = 0.0
+    try:
+        price = float(item.get("price", 0) or 0)
+    except (TypeError, ValueError):
+        price = 0.0
+    try:
+        extra = float(item.get("extra_client_price") or 0)
+    except (TypeError, ValueError):
+        extra = 0.0
+    return price * qty + extra
 
 
 def item_line_base_total(item: dict) -> float:
-    return float(item.get("base_price", item.get("price", 0)) or 0) * int(item.get("qty", 0) or 0)
+    """Sotuvchi ulushi (ortiqcha kg sof narxi bilan)."""
+    try:
+        qty = float(item.get("qty", 0) or 0)
+    except (TypeError, ValueError):
+        qty = 0.0
+    try:
+        base = float(item.get("base_price", item.get("price", 0)) or 0)
+    except (TypeError, ValueError):
+        base = 0.0
+    try:
+        extra = float(item.get("extra_seller_price") or 0)
+    except (TypeError, ValueError):
+        extra = 0.0
+    return base * qty + extra
 
 
 def order_reset_units(item: dict) -> int:
@@ -3550,7 +3585,7 @@ async def admin_dashboard(user=Depends(get_admin)):
     cutoff = admin_dashboard_cutoff(settings)
 
     # Only fields needed for stats — not full order docs
-    proj = {"_id": 0, "created_at": 1, "status": 1, "total": 1, "items.product_id": 1, "items.base_price": 1, "items.price": 1, "items.qty": 1, "items.delivery_status": 1}
+    proj = {"_id": 0, "created_at": 1, "status": 1, "total": 1, "items.product_id": 1, "items.base_price": 1, "items.price": 1, "items.qty": 1, "items.delivery_status": 1, "items.extra_client_price": 1, "items.extra_seller_price": 1, "items.extra_qty": 1}
     orders, products, clients, sellers, couriers_online, pending_products, pending_sellers, total_products, low_stock_count = await asyncio.gather(
         db.orders.find({}, proj).to_list(10000),
         db.products.find({"cost_price": {"$gt": 0}}, {"id": 1, "cost_price": 1, "_id": 0}).to_list(5000),
@@ -3577,27 +3612,47 @@ async def admin_dashboard(user=Depends(get_admin)):
     today_orders = [o for o in orders if (o.get("created_at") or "")[:10] == today]
     today_money_orders = [o for o in money_orders if (o.get("created_at") or "")[:10] == today]
 
-    cost_map = {p["id"]: (p.get("cost_price") or 0) for p in products}
+    cost_map = {p["id"]: float(p.get("cost_price") or 0) for p in products}
 
     def calc_profit(order):
+        """
+        Sof foyda (platforma):
+        1) asosiy: mijoz narxi - sotuvchi narxi (ustama)
+        2) ortiqcha kg: extra_client - extra_seller
+        3) agar ustama 0 va tannarx bor: base - cost_price
+        """
         prof = 0.0
         for it in order.get("items") or []:
-            pid = it.get("product_id")
-            cp = cost_map.get(pid, 0)
-            if cp <= 0:
-                continue
             if it.get("delivery_status") == "returned":
                 continue
-            base_price = it.get("base_price", 0)
-            actual_price = base_price or it.get("price", 0)
-            qty = it.get("qty", 0) or 0
             try:
-                prof += max(0, float(actual_price) - float(cp)) * float(qty)
+                qty = float(it.get("qty", 0) or 0)
+                price = float(it.get("price", 0) or 0)
+                base = float(it.get("base_price") if it.get("base_price") is not None else 0)
+                if base <= 0:
+                    base = price
+                # platforma ustamasi
+                margin = max(0.0, price - base) * qty
+                if margin <= 0:
+                    cp = float(cost_map.get(it.get("product_id"), 0) or 0)
+                    if cp > 0:
+                        margin = max(0.0, base - cp) * qty
+                # ortiqcha kg foydasi
+                extra_c = float(it.get("extra_client_price") or 0)
+                extra_s = float(it.get("extra_seller_price") or 0)
+                if extra_c > 0:
+                    if extra_s > 0:
+                        margin += max(0.0, extra_c - extra_s)
+                    else:
+                        # faqat client summa bor — foiz taxminan default markup
+                        margin += max(0.0, extra_c * 0.0)  # agar seller yozmagan, platform 0
+                        # yoki butun extra_c ni platformaga? yo'q — seller oladi
+                prof += margin
             except (TypeError, ValueError):
                 continue
         return prof
 
-    today_profit = sum(calc_profit(o) for o in today_money_orders if o.get("status") != "cancelled")
+    today_profit = sum(calc_profit(o) for o in today_money_orders if o.get("status") not in ("cancelled", "seller_rejected"))
     total_profit = sum(calc_profit(o) for o in money_orders if o.get("status") == "delivered")
     today_sales_total = sum(float(o.get("total", 0) or 0) for o in today_money_orders if o.get("status") != "cancelled")
     profit_margin = round((today_profit / today_sales_total) * 100, 1) if today_sales_total > 0 else 0.0
