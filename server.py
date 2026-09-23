@@ -571,35 +571,57 @@ async def telegram_webhook(update: dict, x_telegram_bot_api_secret_token: Option
 
         # Kontakt ulashildi
         if contact and contact.get("phone_number"):
-            # Faqat o'z kontaktini qabul qilamiz
             if contact.get("user_id") and from_user.get("id") and contact.get("user_id") != from_user.get("id"):
                 await telegram_send_message(chat_id, "Faqat o'zingizning telefon raqamingizni ulashing.")
                 return {"ok": True}
             phone = normalize_phone(str(contact.get("phone_number")))
             await link_telegram_phone(chat_id, phone, from_user)
-            await telegram_send_message(
-                chat_id,
-                f"✅ Raqam ulandi: <b>{phone}</b>\n\nEndi ilovada shu raqam bilan kirishingiz mumkin — tasdiqlash kodi shu yerga keladi.",
+            # Oxirgi faol OTP ni yuborish (ilovada kod so'ragan bo'lsa)
+            otp = await db.otps.find_one(
+                {"phone": phone, "used": False},
+                sort=[("created_at", -1)],
             )
+            code_to_send = None
+            if otp:
+                exp = parse_iso_dt(otp.get("expires_at"))
+                if exp and exp >= now():
+                    code_to_send = otp.get("code")
+            if code_to_send:
+                await telegram_send_message(
+                    chat_id,
+                    f"✅ Raqam ulandi: <b>{phone}</b>\n\n"
+                    f"<b>ZarraMarket</b> tasdiqlash kodi:\n\n<code>{code_to_send}</code>\n\n"
+                    f"Ilovaga qaytib kodni kiriting.",
+                )
+            else:
+                await telegram_send_message(
+                    chat_id,
+                    f"✅ Raqam ulandi: <b>{phone}</b>\n\n"
+                    f"Endi ilovada «Kod olish» ni bosing — kod shu yerga keladi.",
+                )
             return {"ok": True}
 
         if text.startswith("/start") or text in ("/help", "start"):
-            # /start TOKEN — ilovadan kelgan deep link
             parts = text.split(maxsplit=1)
             payload = (parts[1].strip() if len(parts) > 1 else "") or ""
+            # Deep link: /start TOKEN
             if payload and payload not in ("start", "help"):
-                tok = await db.telegram_start_tokens.find_one(
-                    {"token": payload, "used": False},
-                    sort=[("created_at", -1)],
-                )
-                if tok and tok.get("expires_at", "") >= iso():
+                tok = await db.telegram_start_tokens.find_one({"token": payload})
+                valid = False
+                if tok:
+                    exp = parse_iso_dt(tok.get("expires_at"))
+                    valid = bool(exp and exp >= now())
+                if tok and valid:
                     phone = normalize_phone(tok["phone"])
                     code = tok.get("code") or ""
                     await link_telegram_phone(chat_id, phone, from_user)
                     await db.telegram_start_tokens.update_one(
-                        {"token": payload}, {"$set": {"used": True, "chat_id": chat_id}}
+                        {"token": payload}, {"$set": {"used": True, "chat_id": int(chat_id)}}
                     )
-                    # Kodni darhol yuborish
+                    if not code:
+                        otp = await db.otps.find_one({"phone": phone, "used": False}, sort=[("created_at", -1)])
+                        if otp:
+                            code = otp.get("code") or ""
                     if code:
                         await telegram_send_message(
                             chat_id,
@@ -613,12 +635,20 @@ async def telegram_webhook(update: dict, x_telegram_bot_api_secret_token: Option
                             f"✅ Raqam ulandi: <b>{phone}</b>\nIlovada qayta «Kod olish» ni bosing.",
                         )
                     return {"ok": True}
-                else:
-                    await telegram_send_message(
-                        chat_id,
-                        "Havola eskirgan yoki noto'g'ri. Ilovada qayta «Kod olish» ni bosing.",
-                    )
-                    return {"ok": True}
+                # Token yo'q/eskirgan — baribir kontakt so'raymiz
+                kb = {
+                    "keyboard": [[{"text": "📱 Telefon raqamni ulash", "request_contact": True}]],
+                    "resize_keyboard": True,
+                    "one_time_keyboard": True,
+                }
+                await telegram_send_message(
+                    chat_id,
+                    "Havola eskirgan bo'lishi mumkin.\n\n"
+                    "1) Ilovada qayta <b>«Kod olish»</b> ni bosing\n"
+                    "2) Yoki pastdagi tugma orqali <b>telefon raqamni ulash</b>ng",
+                    reply_markup=kb,
+                )
+                return {"ok": True}
 
             kb = {
                 "keyboard": [[{"text": "📱 Telefon raqamni ulash", "request_contact": True}]],
@@ -628,9 +658,9 @@ async def telegram_webhook(update: dict, x_telegram_bot_api_secret_token: Option
             await telegram_send_message(
                 chat_id,
                 "Assalomu alaykum! <b>ZarraMarket</b> botiga xush kelibsiz.\n\n"
-                "Ilovadan kirish uchun avval ilovada telefon raqamingizni kiriting va «Kod olish» ni bosing — "
-                "Telegram avtomatik ochiladi.\n\n"
-                "Yoki pastdagi tugma orqali raqamni ulashing.",
+                "1️⃣ Ilovada telefon raqamingizni kiriting\n"
+                "2️⃣ <b>«Kod olish»</b> ni bosing (Telegram ochiladi)\n"
+                "3️⃣ Yoki hozir pastdagi tugma bilan raqamni ulashng",
                 reply_markup=kb,
             )
             return {"ok": True}
