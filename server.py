@@ -18,6 +18,9 @@ from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime, timezone, timedelta
 import time
+import json
+import urllib.request
+import urllib.error
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -35,6 +38,9 @@ client = AsyncIOMotorClient(
 )
 db = client[os.environ['DB_NAME']]
 JWT_SECRET = os.environ['JWT_SECRET']
+TELEGRAM_BOT_TOKEN = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+TELEGRAM_BOT_USERNAME = (os.environ.get("TELEGRAM_BOT_USERNAME") or "").strip().lstrip("@")
+TELEGRAM_WEBHOOK_SECRET = (os.environ.get("TELEGRAM_WEBHOOK_SECRET") or "").strip()
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -460,29 +466,295 @@ def shop_location(seller_user: Optional[dict]):
     return TASHKENT_CENTER
 
 
+
+# ---------- Telegram OTP bot ----------
+def normalize_phone(raw: str) -> str:
+    digits = re.sub(r"[^\d+]", "", raw or "")
+    if digits.startswith("00"):
+        digits = "+" + digits[2:]
+    if not digits.startswith("+") and len(digits) >= 9:
+        # O'zbekiston: 998...
+        if digits.startswith("998"):
+            digits = "+" + digits
+        elif len(digits) == 9:
+            digits = "+998" + digits
+        else:
+            digits = "+" + digits
+    return digits
+
+
+def _telegram_api(method: str, payload: dict) -> dict:
+    """Sinxron Telegram Bot API chaqiruvi."""
+    if not TELEGRAM_BOT_TOKEN:
+        return {"ok": False, "description": "TELEGRAM_BOT_TOKEN yo'q"}
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8")
+            return json.loads(body)
+        except Exception:
+            return {"ok": False, "description": str(e)}
+    except Exception as e:
+        return {"ok": False, "description": str(e)}
+
+
+async def telegram_send_message(chat_id, text: str, reply_markup: Optional[dict] = None) -> bool:
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    loop = asyncio.get_event_loop()
+    res = await loop.run_in_executor(None, lambda: _telegram_api("sendMessage", payload))
+    ok = bool(res.get("ok"))
+    if not ok:
+        logger.warning("Telegram send failed: %s", res)
+    return ok
+
+
+async def find_telegram_chat_id(phone: str) -> Optional[int]:
+    phone = normalize_phone(phone)
+    # variants
+    variants = {phone}
+    if phone.startswith("+"):
+        variants.add(phone[1:])
+    link = await db.telegram_links.find_one({"phone": {"$in": list(variants)}}, sort=[("linked_at", -1)])
+    if link and link.get("chat_id") is not None:
+        return link["chat_id"]
+    # users collection fallback
+    u = await db.users.find_one({"phone": {"$in": list(variants)}, "telegram_chat_id": {"$ne": None}})
+    if u and u.get("telegram_chat_id") is not None:
+        return u["telegram_chat_id"]
+    return None
+
+
+async def link_telegram_phone(chat_id: int, phone: str, tg_user: Optional[dict] = None):
+    phone = normalize_phone(phone)
+    doc = {
+        "phone": phone,
+        "chat_id": int(chat_id),
+        "telegram_user_id": (tg_user or {}).get("id"),
+        "telegram_username": (tg_user or {}).get("username"),
+        "linked_at": iso(),
+    }
+    await db.telegram_links.update_one(
+        {"phone": phone},
+        {"$set": doc},
+        upsert=True,
+    )
+    await db.users.update_one(
+        {"phone": phone},
+        {"$set": {"telegram_chat_id": int(chat_id), "telegram_username": (tg_user or {}).get("username")}},
+    )
+
+
 # ---------- Auth ----------
+
+@api_router.post("/telegram/webhook")
+async def telegram_webhook(update: dict, x_telegram_bot_api_secret_token: Optional[str] = Header(None)):
+    """Telegram bot webhook: /start va kontakt ulash orqali phone ↔ chat_id bog'lash."""
+    if TELEGRAM_WEBHOOK_SECRET and x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(403, "Forbidden")
+    try:
+        message = update.get("message") or update.get("edited_message") or {}
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        from_user = message.get("from") or {}
+        text = (message.get("text") or "").strip()
+        contact = message.get("contact")
+
+        if not chat_id:
+            return {"ok": True}
+
+        # Kontakt ulashildi
+        if contact and contact.get("phone_number"):
+            # Faqat o'z kontaktini qabul qilamiz
+            if contact.get("user_id") and from_user.get("id") and contact.get("user_id") != from_user.get("id"):
+                await telegram_send_message(chat_id, "Faqat o'zingizning telefon raqamingizni ulashing.")
+                return {"ok": True}
+            phone = normalize_phone(str(contact.get("phone_number")))
+            await link_telegram_phone(chat_id, phone, from_user)
+            await telegram_send_message(
+                chat_id,
+                f"✅ Raqam ulandi: <b>{phone}</b>\n\nEndi ilovada shu raqam bilan kirishingiz mumkin — tasdiqlash kodi shu yerga keladi.",
+            )
+            return {"ok": True}
+
+        if text.startswith("/start") or text in ("/help", "start"):
+            # /start TOKEN — ilovadan kelgan deep link
+            parts = text.split(maxsplit=1)
+            payload = (parts[1].strip() if len(parts) > 1 else "") or ""
+            if payload and payload not in ("start", "help"):
+                tok = await db.telegram_start_tokens.find_one(
+                    {"token": payload, "used": False},
+                    sort=[("created_at", -1)],
+                )
+                if tok and tok.get("expires_at", "") >= iso():
+                    phone = normalize_phone(tok["phone"])
+                    code = tok.get("code") or ""
+                    await link_telegram_phone(chat_id, phone, from_user)
+                    await db.telegram_start_tokens.update_one(
+                        {"token": payload}, {"$set": {"used": True, "chat_id": chat_id}}
+                    )
+                    # Kodni darhol yuborish
+                    if code:
+                        await telegram_send_message(
+                            chat_id,
+                            f"<b>ZarraMarket</b> tasdiqlash kodi:\n\n"
+                            f"<code>{code}</code>\n\n"
+                            f"Kod 5 daqiqa amal qiladi. Ilovaga qaytib kodni kiriting.",
+                        )
+                    else:
+                        await telegram_send_message(
+                            chat_id,
+                            f"✅ Raqam ulandi: <b>{phone}</b>\nIlovada qayta «Kod olish» ni bosing.",
+                        )
+                    return {"ok": True}
+                else:
+                    await telegram_send_message(
+                        chat_id,
+                        "Havola eskirgan yoki noto'g'ri. Ilovada qayta «Kod olish» ni bosing.",
+                    )
+                    return {"ok": True}
+
+            kb = {
+                "keyboard": [[{"text": "📱 Telefon raqamni ulash", "request_contact": True}]],
+                "resize_keyboard": True,
+                "one_time_keyboard": True,
+            }
+            await telegram_send_message(
+                chat_id,
+                "Assalomu alaykum! <b>ZarraMarket</b> botiga xush kelibsiz.\n\n"
+                "Ilovadan kirish uchun avval ilovada telefon raqamingizni kiriting va «Kod olish» ni bosing — "
+                "Telegram avtomatik ochiladi.\n\n"
+                "Yoki pastdagi tugma orqali raqamni ulashing.",
+                reply_markup=kb,
+            )
+            return {"ok": True}
+
+        if text:
+            await telegram_send_message(
+                chat_id,
+                "Telefon raqamni ulash uchun /start bosing va «Telefon raqamni ulash» tugmasini bosing.",
+            )
+        return {"ok": True}
+    except Exception as e:
+        logger.exception("telegram webhook: %s", e)
+        return {"ok": True}
+
+
+@api_router.get("/telegram/bot-info")
+async def telegram_bot_info():
+    """Frontend uchun bot username/link."""
+    return {
+        "configured": bool(TELEGRAM_BOT_TOKEN),
+        "username": TELEGRAM_BOT_USERNAME or None,
+        "link": f"https://t.me/{TELEGRAM_BOT_USERNAME}" if TELEGRAM_BOT_USERNAME else None,
+    }
+
 @api_router.post("/auth/send-otp")
 async def send_otp(req: SendOtpReq):
-    phone = re.sub(r"[^\d+]", "", req.phone)
-    if len(phone) < 9:
+    """
+    1) Agar raqam botga ulangan bo'lsa — kod to'g'ridan Telegramga.
+    2) Aks holda — deep link qaytariladi: ilova t.me/Bot?start=TOKEN ochadi,
+       foydalanuvchi Start bosadi → bot kodni yuboradi.
+    """
+    phone = normalize_phone(req.phone)
+    if len(re.sub(r"\D", "", phone)) < 9:
         raise HTTPException(400, "Telefon raqam noto'g'ri")
     minute_ago = iso(now() - timedelta(minutes=1))
     hour_ago = iso(now() - timedelta(hours=1))
     if await db.otps.find_one({"phone": phone, "created_at": {"$gt": minute_ago}}):
-        raise HTTPException(429, "1 daqiqada faqat 1 ta SMS yuborish mumkin")
+        raise HTTPException(429, "1 daqiqada faqat 1 ta kod yuborish mumkin")
     if await db.otps.count_documents({"phone": phone, "created_at": {"$gt": hour_ago}}) >= 5:
-        raise HTTPException(429, "1 soatda maksimum 5 ta SMS. Keyinroq urinib ko'ring")
+        raise HTTPException(429, "1 soatda maksimum 5 ta kod. Keyinroq urinib ko'ring")
+
     code = f"{random.randint(100000, 999999)}"
-    await db.otps.insert_one({"id": uid(), "phone": phone, "code": code, "expires_at": iso(now() + timedelta(minutes=2)), "created_at": iso(), "used": False})
-    await db.sms_log.insert_one({"id": uid(), "phone": phone, "text": f"UzMarket tasdiqlash kodi: {code}", "status": "demo", "sent_at": iso()})
+    await db.otps.insert_one({
+        "id": uid(), "phone": phone, "code": code,
+        "expires_at": iso(now() + timedelta(minutes=5)),
+        "created_at": iso(), "used": False,
+    })
     exists = await db.users.find_one({"phone": phone}) is not None
-    logger.info(f"DEMO OTP for {phone}: {code}")
-    return {"demo_code": code, "expires_in": 120, "exists": exists, "demo": True}
+    bot_username = TELEGRAM_BOT_USERNAME or "your_bot"
+    bot_link_base = f"https://t.me/{bot_username}"
+
+    if not TELEGRAM_BOT_TOKEN:
+        await db.sms_log.insert_one({
+            "id": uid(), "phone": phone, "text": f"OTP {code}", "status": "demo", "sent_at": iso(),
+        })
+        logger.info(f"DEMO OTP for {phone}: {code}")
+        return {
+            "demo_code": code,
+            "expires_in": 300,
+            "exists": exists,
+            "demo": True,
+            "channel": "demo",
+            "need_start": False,
+            "message": "Demo rejim — kod ekranda",
+            "bot_link": bot_link_base if TELEGRAM_BOT_USERNAME else None,
+        }
+
+    chat_id = await find_telegram_chat_id(phone)
+    if chat_id:
+        text = (
+            f"<b>ZarraMarket</b> tasdiqlash kodi:\n\n"
+            f"<code>{code}</code>\n\n"
+            f"Kod 5 daqiqa amal qiladi. Hech kimga bermang."
+        )
+        ok = await telegram_send_message(chat_id, text)
+        await db.sms_log.insert_one({
+            "id": uid(), "phone": phone, "text": f"OTP chat={chat_id}",
+            "status": "telegram_ok" if ok else "telegram_fail", "sent_at": iso(),
+        })
+        if not ok:
+            # bog'lanish buzilgan — qayta start
+            chat_id = None
+        else:
+            return {
+                "expires_in": 300,
+                "exists": exists,
+                "demo": False,
+                "channel": "telegram",
+                "need_start": False,
+                "message": "Kod Telegramga yuborildi",
+                "bot_link": bot_link_base,
+                "bot_username": bot_username,
+            }
+
+    # Ulanmagan: deep-link token
+    token = uid().replace("-", "")[:16]
+    await db.telegram_start_tokens.insert_one({
+        "token": token,
+        "phone": phone,
+        "code": code,
+        "expires_at": iso(now() + timedelta(minutes=10)),
+        "created_at": iso(),
+        "used": False,
+    })
+    deep = f"{bot_link_base}?start={token}"
+    await db.sms_log.insert_one({
+        "id": uid(), "phone": phone, "text": f"OTP pending start token={token}",
+        "status": "await_start", "sent_at": iso(),
+    })
+    return {
+        "expires_in": 300,
+        "exists": exists,
+        "demo": False,
+        "channel": "telegram_start",
+        "need_start": True,
+        "message": "Telegram ochiladi — Start bosing, kod botga keladi",
+        "bot_link": deep,
+        "bot_username": bot_username,
+    }
 
 
 @api_router.post("/auth/verify-otp")
 async def verify_otp(req: VerifyOtpReq):
-    phone = re.sub(r"[^\d+]", "", req.phone)
+    phone = normalize_phone(req.phone)
     otp = await db.otps.find_one({"phone": phone, "code": req.code, "used": False}, sort=[("created_at", -1)])
     if not otp:
         raise HTTPException(400, "Kod noto'g'ri")
