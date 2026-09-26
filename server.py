@@ -5081,7 +5081,7 @@ async def seed():
                 {"id": "main"},
                 {"$set": {
                     "id": "main",
-                    "delivery_fee": 15000,
+                    "delivery_fee": 0,
                     "min_order": 0,
                     "commission_default": 10,
                     "default_markup_percent": 0,
