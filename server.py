@@ -473,7 +473,6 @@ def normalize_phone(raw: str) -> str:
     if digits.startswith("00"):
         digits = "+" + digits[2:]
     if not digits.startswith("+") and len(digits) >= 9:
-        # O'zbekiston: 998...
         if digits.startswith("998"):
             digits = "+" + digits
         elif len(digits) == 9:
@@ -481,6 +480,25 @@ def normalize_phone(raw: str) -> str:
         else:
             digits = "+" + digits
     return digits
+
+
+def is_valid_uz_phone(phone: str) -> bool:
+    """Faqat to'liq O'zbekiston mobil raqami: +998 XX XXX XX XX (12 raqam)."""
+    p = normalize_phone(phone)
+    digits = re.sub(r"\D", "", p)
+    if not digits.startswith("998") or len(digits) != 12:
+        return False
+    # operator kodi 9X (90-99, 33, 88 va hokazo — 2 raqam, 0 emas)
+    op = digits[3:5]
+    if not op.isdigit():
+        return False
+    rest = digits[5:]
+    if len(rest) != 7 or not rest.isdigit():
+        return False
+    # 0000000 kabi yolg'on raqamlar
+    if rest == "0000000" or len(set(rest)) == 1:
+        return False
+    return True
 
 
 def _telegram_api(method: str, payload: dict) -> dict:
@@ -515,20 +533,73 @@ async def telegram_send_message(chat_id, text: str, reply_markup: Optional[dict]
     return ok
 
 
+async def phone_variants(phone: str):
+    p = normalize_phone(phone)
+    digits = re.sub(r"\D", "", p)
+    out = {p, digits}
+    if p.startswith("+"):
+        out.add(p[1:])
+    if digits.startswith("998") and len(digits) == 12:
+        out.add("+" + digits)
+        out.add(digits)
+    return list(out)
+
+
 async def find_telegram_chat_id(phone: str) -> Optional[int]:
-    phone = normalize_phone(phone)
-    # variants
-    variants = {phone}
-    if phone.startswith("+"):
-        variants.add(phone[1:])
-    link = await db.telegram_links.find_one({"phone": {"$in": list(variants)}}, sort=[("linked_at", -1)])
+    variants = await phone_variants(phone)
+    link = await db.telegram_links.find_one(
+        {"phone": {"$in": variants}},
+        sort=[("linked_at", -1)],
+    )
     if link and link.get("chat_id") is not None:
-        return link["chat_id"]
-    # users collection fallback
-    u = await db.users.find_one({"phone": {"$in": list(variants)}, "telegram_chat_id": {"$ne": None}})
+        return int(link["chat_id"])
+    # chat_id orqali ham (ba'zan phone format farq qiladi)
+    link2 = await db.telegram_links.find_one(
+        {"phone": {"$in": variants}},
+    )
+    if link2 and link2.get("chat_id") is not None:
+        return int(link2["chat_id"])
+    u = await db.users.find_one({"phone": {"$in": variants}, "telegram_chat_id": {"$ne": None}})
     if u and u.get("telegram_chat_id") is not None:
-        return u["telegram_chat_id"]
+        return int(u["telegram_chat_id"])
     return None
+
+
+async def find_phone_by_chat_id(chat_id) -> Optional[str]:
+    try:
+        cid = int(chat_id)
+    except Exception:
+        return None
+    link = await db.telegram_links.find_one({"chat_id": cid}, sort=[("linked_at", -1)])
+    if link and link.get("phone"):
+        return normalize_phone(str(link["phone"]))
+    u = await db.users.find_one({"telegram_chat_id": cid})
+    if u and u.get("phone"):
+        return normalize_phone(str(u["phone"]))
+    return None
+
+
+async def find_latest_otp(phone: str) -> Optional[dict]:
+    variants = await phone_variants(phone)
+    otp = await db.otps.find_one(
+        {"phone": {"$in": variants}, "used": False},
+        sort=[("created_at", -1)],
+    )
+    if not otp:
+        return None
+    exp = parse_iso_dt(otp.get("expires_at"))
+    if exp and exp >= now():
+        return otp
+    return None
+
+
+async def deliver_otp_code(chat_id, code: str) -> bool:
+    return await telegram_send_message(
+        chat_id,
+        f"<b>ZarraMarket</b> tasdiqlash kodi:\n\n"
+        f"<code>{code}</code>\n\n"
+        f"Kod 5 daqiqa amal qiladi. Ilovaga qaytib kodni kiriting. Hech kimga bermang.",
+    )
 
 
 async def link_telegram_phone(chat_id: int, phone: str, tg_user: Optional[dict] = None):
@@ -540,11 +611,8 @@ async def link_telegram_phone(chat_id: int, phone: str, tg_user: Optional[dict] 
         "telegram_username": (tg_user or {}).get("username"),
         "linked_at": iso(),
     }
-    await db.telegram_links.update_one(
-        {"phone": phone},
-        {"$set": doc},
-        upsert=True,
-    )
+    await db.telegram_links.update_one({"phone": phone}, {"$set": doc}, upsert=True)
+    await db.telegram_links.update_one({"chat_id": int(chat_id)}, {"$set": doc}, upsert=True)
     await db.users.update_one(
         {"phone": phone},
         {"$set": {"telegram_chat_id": int(chat_id), "telegram_username": (tg_user or {}).get("username")}},
@@ -555,7 +623,7 @@ async def link_telegram_phone(chat_id: int, phone: str, tg_user: Optional[dict] 
 
 @api_router.post("/telegram/webhook")
 async def telegram_webhook(update: dict, x_telegram_bot_api_secret_token: Optional[str] = Header(None)):
-    """Telegram bot webhook: /start va kontakt ulash orqali phone ↔ chat_id bog'lash."""
+    """Telegram bot webhook: /start va kontakt — phone ↔ chat_id, OTP yuborish."""
     if TELEGRAM_WEBHOOK_SECRET and x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
         raise HTTPException(403, "Forbidden")
     try:
@@ -569,106 +637,92 @@ async def telegram_webhook(update: dict, x_telegram_bot_api_secret_token: Option
         if not chat_id:
             return {"ok": True}
 
-        # Kontakt ulashildi
+        kb_contact = {
+            "keyboard": [[{"text": "📱 Telefon raqamni ulash", "request_contact": True}]],
+            "resize_keyboard": True,
+            "one_time_keyboard": True,
+        }
+
+        # --- Kontakt ---
         if contact and contact.get("phone_number"):
             if contact.get("user_id") and from_user.get("id") and contact.get("user_id") != from_user.get("id"):
                 await telegram_send_message(chat_id, "Faqat o'zingizning telefon raqamingizni ulashing.")
                 return {"ok": True}
             phone = normalize_phone(str(contact.get("phone_number")))
             await link_telegram_phone(chat_id, phone, from_user)
-            # Oxirgi faol OTP ni yuborish (ilovada kod so'ragan bo'lsa)
-            otp = await db.otps.find_one(
-                {"phone": phone, "used": False},
-                sort=[("created_at", -1)],
-            )
-            code_to_send = None
-            if otp:
-                exp = parse_iso_dt(otp.get("expires_at"))
-                if exp and exp >= now():
-                    code_to_send = otp.get("code")
-            if code_to_send:
-                await telegram_send_message(
-                    chat_id,
-                    f"✅ Raqam ulandi: <b>{phone}</b>\n\n"
-                    f"<b>ZarraMarket</b> tasdiqlash kodi:\n\n<code>{code_to_send}</code>\n\n"
-                    f"Ilovaga qaytib kodni kiriting.",
-                )
+            otp = await find_latest_otp(phone)
+            if otp and otp.get("code"):
+                await deliver_otp_code(chat_id, otp["code"])
             else:
                 await telegram_send_message(
                     chat_id,
                     f"✅ Raqam ulandi: <b>{phone}</b>\n\n"
-                    f"Endi ilovada «Kod olish» ni bosing — kod shu yerga keladi.",
+                    f"Endi ilovada <b>«Kod olish»</b> ni bosing — kod shu yerga keladi.",
                 )
             return {"ok": True}
 
+        # --- /start [TOKEN] ---
         if text.startswith("/start") or text in ("/help", "start"):
             parts = text.split(maxsplit=1)
             payload = (parts[1].strip() if len(parts) > 1 else "") or ""
-            # Deep link: /start TOKEN
+
+            phone = None
+            code = None
+
             if payload and payload not in ("start", "help"):
                 tok = await db.telegram_start_tokens.find_one({"token": payload})
-                valid = False
                 if tok:
                     exp = parse_iso_dt(tok.get("expires_at"))
-                    valid = bool(exp and exp >= now())
-                if tok and valid:
-                    phone = normalize_phone(tok["phone"])
-                    code = tok.get("code") or ""
-                    await link_telegram_phone(chat_id, phone, from_user)
-                    await db.telegram_start_tokens.update_one(
-                        {"token": payload}, {"$set": {"used": True, "chat_id": int(chat_id)}}
-                    )
-                    if not code:
-                        otp = await db.otps.find_one({"phone": phone, "used": False}, sort=[("created_at", -1)])
-                        if otp:
-                            code = otp.get("code") or ""
-                    if code:
-                        await telegram_send_message(
-                            chat_id,
-                            f"<b>ZarraMarket</b> tasdiqlash kodi:\n\n"
-                            f"<code>{code}</code>\n\n"
-                            f"Kod 5 daqiqa amal qiladi. Ilovaga qaytib kodni kiriting.",
+                    if exp and exp >= now():
+                        phone = normalize_phone(tok.get("phone") or "")
+                        code = tok.get("code") or ""
+                        await link_telegram_phone(chat_id, phone, from_user)
+                        await db.telegram_start_tokens.update_one(
+                            {"token": payload},
+                            {"$set": {"used": True, "chat_id": int(chat_id)}},
                         )
-                    else:
-                        await telegram_send_message(
-                            chat_id,
-                            f"✅ Raqam ulandi: <b>{phone}</b>\nIlovada qayta «Kod olish» ni bosing.",
-                        )
-                    return {"ok": True}
-                # Token yo'q/eskirgan — baribir kontakt so'raymiz
-                kb = {
-                    "keyboard": [[{"text": "📱 Telefon raqamni ulash", "request_contact": True}]],
-                    "resize_keyboard": True,
-                    "one_time_keyboard": True,
-                }
+
+            # Token ishlamasa ham — chat allaqachon ulangan bo'lsa
+            if not phone:
+                phone = await find_phone_by_chat_id(chat_id)
+
+            if phone and not code:
+                otp = await find_latest_otp(phone)
+                if otp:
+                    code = otp.get("code")
+
+            if phone and code:
+                await deliver_otp_code(chat_id, code)
+                return {"ok": True}
+
+            if phone:
                 await telegram_send_message(
                     chat_id,
-                    "Havola eskirgan bo'lishi mumkin.\n\n"
-                    "1) Ilovada qayta <b>«Kod olish»</b> ni bosing\n"
-                    "2) Yoki pastdagi tugma orqali <b>telefon raqamni ulash</b>ng",
-                    reply_markup=kb,
+                    f"✅ Raqamingiz ulangan: <b>{phone}</b>\n\n"
+                    f"Ilovada <b>«Kod olish»</b> ni bosing — kod shu chatga keladi.",
                 )
                 return {"ok": True}
 
-            kb = {
-                "keyboard": [[{"text": "📱 Telefon raqamni ulash", "request_contact": True}]],
-                "resize_keyboard": True,
-                "one_time_keyboard": True,
-            }
             await telegram_send_message(
                 chat_id,
-                "Assalomu alaykum! <b>ZarraMarket</b> botiga xush kelibsiz.\n\n"
-                "1️⃣ Ilovada telefon raqamingizni kiriting\n"
-                "2️⃣ <b>«Kod olish»</b> ni bosing (Telegram ochiladi)\n"
-                "3️⃣ Yoki hozir pastdagi tugma bilan raqamni ulashng",
-                reply_markup=kb,
+                "Assalomu alaykum! <b>ZarraMarket</b>\n\n"
+                "1️⃣ Ilovada telefon → <b>Kod olish</b>\n"
+                "2️⃣ Yoki pastdan <b>telefon raqamni ulash</b>",
+                reply_markup=kb_contact,
             )
             return {"ok": True}
 
         if text:
+            phone = await find_phone_by_chat_id(chat_id)
+            if phone:
+                otp = await find_latest_otp(phone)
+                if otp and otp.get("code"):
+                    await deliver_otp_code(chat_id, otp["code"])
+                    return {"ok": True}
             await telegram_send_message(
                 chat_id,
-                "Telefon raqamni ulash uchun /start bosing va «Telefon raqamni ulash» tugmasini bosing.",
+                "Kod olish uchun ilovada «Kod olish» ni bosing yoki /start yozing.",
+                reply_markup=kb_contact,
             )
         return {"ok": True}
     except Exception as e:
@@ -693,21 +747,23 @@ async def send_otp(req: SendOtpReq):
        foydalanuvchi Start bosadi → bot kodni yuboradi.
     """
     phone = normalize_phone(req.phone)
-    if len(re.sub(r"\D", "", phone)) < 9:
-        raise HTTPException(400, "Telefon raqam noto'g'ri")
-    minute_ago = iso(now() - timedelta(minutes=1))
+    if not is_valid_uz_phone(phone):
+        raise HTTPException(400, "Telefon raqam noto'g'ri. Format: +998 XX XXX XX XX")
     hour_ago = iso(now() - timedelta(hours=1))
-    if await db.otps.find_one({"phone": phone, "created_at": {"$gt": minute_ago}}):
-        raise HTTPException(429, "1 daqiqada faqat 1 ta kod yuborish mumkin")
-    if await db.otps.count_documents({"phone": phone, "created_at": {"$gt": hour_ago}}) >= 5:
-        raise HTTPException(429, "1 soatda maksimum 5 ta kod. Keyinroq urinib ko'ring")
+    if await db.otps.count_documents({"phone": phone, "created_at": {"$gt": hour_ago}}) >= 8:
+        raise HTTPException(429, "1 soatda maksimum 8 ta kod. Keyinroq urinib ko'ring")
 
-    code = f"{random.randint(100000, 999999)}"
-    await db.otps.insert_one({
-        "id": uid(), "phone": phone, "code": code,
-        "expires_at": iso(now() + timedelta(minutes=5)),
-        "created_at": iso(), "used": False,
-    })
+    # Amaldagi kod bo'lsa — yangisini yaratmasdan qayta yuboramiz
+    existing = await find_latest_otp(phone)
+    if existing and existing.get("code"):
+        code = str(existing["code"])
+    else:
+        code = f"{random.randint(100000, 999999)}"
+        await db.otps.insert_one({
+            "id": uid(), "phone": phone, "code": code,
+            "expires_at": iso(now() + timedelta(minutes=5)),
+            "created_at": iso(), "used": False,
+        })
     exists = await db.users.find_one({"phone": phone}) is not None
     bot_username = TELEGRAM_BOT_USERNAME or "your_bot"
     bot_link_base = f"https://t.me/{bot_username}"
@@ -5081,7 +5137,7 @@ async def seed():
                 {"id": "main"},
                 {"$set": {
                     "id": "main",
-                    "delivery_fee": 0,
+                    "delivery_fee": 15000,
                     "min_order": 0,
                     "commission_default": 10,
                     "default_markup_percent": 0,
