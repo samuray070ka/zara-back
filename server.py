@@ -623,7 +623,9 @@ async def link_telegram_phone(chat_id: int, phone: str, tg_user: Optional[dict] 
 
 @api_router.post("/telegram/webhook")
 async def telegram_webhook(update: dict, x_telegram_bot_api_secret_token: Optional[str] = Header(None)):
-    """Telegram bot webhook: /start va kontakt — phone ↔ chat_id, OTP yuborish."""
+    """
+    OTP faqat Telegram kontaktidagi raqam == ilovada kiritilgan raqam bo'lsa yuboriladi.
+    """
     if TELEGRAM_WEBHOOK_SECRET and x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
         raise HTTPException(403, "Forbidden")
     try:
@@ -643,21 +645,59 @@ async def telegram_webhook(update: dict, x_telegram_bot_api_secret_token: Option
             "one_time_keyboard": True,
         }
 
-        # --- Kontakt ---
+        async def phones_equal(a: str, b: str) -> bool:
+            da = re.sub(r"\D", "", normalize_phone(a))
+            db = re.sub(r"\D", "", normalize_phone(b))
+            return bool(da) and da == db
+
+        # --- Kontakt ulash: asosiy tekshiruv ---
         if contact and contact.get("phone_number"):
             if contact.get("user_id") and from_user.get("id") and contact.get("user_id") != from_user.get("id"):
                 await telegram_send_message(chat_id, "Faqat o'zingizning telefon raqamingizni ulashing.")
                 return {"ok": True}
-            phone = normalize_phone(str(contact.get("phone_number")))
-            await link_telegram_phone(chat_id, phone, from_user)
-            otp = await find_latest_otp(phone)
+
+            tg_phone = normalize_phone(str(contact.get("phone_number")))
+            pending = await db.telegram_pending.find_one({"chat_id": int(chat_id)}, sort=[("created_at", -1)])
+            expected = None
+            code = None
+            if pending:
+                exp = parse_iso_dt(pending.get("expires_at"))
+                if exp and exp >= now():
+                    expected = normalize_phone(pending.get("phone") or "")
+                    code = pending.get("code") or ""
+
+            if expected and not await phones_equal(tg_phone, expected):
+                await telegram_send_message(
+                    chat_id,
+                    f"❌ Raqam mos kelmadi.\n\n"
+                    f"Ilovada: <b>{expected}</b>\n"
+                    f"Telegram: <b>{tg_phone}</b>\n\n"
+                    f"Bir xil raqam bo'lishi shart. Ilovada o'z raqamingizni yozing va qayta «Kod olish» ni bosing.",
+                )
+                return {"ok": True}
+
+            # Mos keldi yoki pending yo'q (faqat ulash)
+            await link_telegram_phone(chat_id, tg_phone, from_user)
+            if pending and expected and await phones_equal(tg_phone, expected):
+                await db.telegram_pending.update_one(
+                    {"_id": pending["_id"]} if pending.get("_id") is not None else {"chat_id": int(chat_id)},
+                    {"$set": {"used": True}},
+                )
+                if not code:
+                    otp = await find_latest_otp(tg_phone)
+                    code = (otp or {}).get("code") or ""
+                if code:
+                    await deliver_otp_code(chat_id, code)
+                    return {"ok": True}
+
+            otp = await find_latest_otp(tg_phone)
             if otp and otp.get("code"):
                 await deliver_otp_code(chat_id, otp["code"])
             else:
                 await telegram_send_message(
                     chat_id,
-                    f"✅ Raqam ulandi: <b>{phone}</b>\n\n"
-                    f"Endi ilovada <b>«Kod olish»</b> ni bosing — kod shu yerga keladi.",
+                    f"✅ Raqam ulandi: <b>{tg_phone}</b>\n\n"
+                    f"Ilovada shu raqam bilan <b>«Kod olish»</b> ni bosing.",
                 )
             return {"ok": True}
 
@@ -666,7 +706,7 @@ async def telegram_webhook(update: dict, x_telegram_bot_api_secret_token: Option
             parts = text.split(maxsplit=1)
             payload = (parts[1].strip() if len(parts) > 1 else "") or ""
 
-            phone = None
+            expected_phone = None
             code = None
 
             if payload and payload not in ("start", "help"):
@@ -674,54 +714,68 @@ async def telegram_webhook(update: dict, x_telegram_bot_api_secret_token: Option
                 if tok:
                     exp = parse_iso_dt(tok.get("expires_at"))
                     if exp and exp >= now():
-                        phone = normalize_phone(tok.get("phone") or "")
+                        expected_phone = normalize_phone(tok.get("phone") or "")
                         code = tok.get("code") or ""
-                        await link_telegram_phone(chat_id, phone, from_user)
                         await db.telegram_start_tokens.update_one(
                             {"token": payload},
                             {"$set": {"used": True, "chat_id": int(chat_id)}},
                         )
+                        # Pending saqlaymiz — kontakt bilan solishtirish uchun
+                        await db.telegram_pending.update_one(
+                            {"chat_id": int(chat_id)},
+                            {"$set": {
+                                "chat_id": int(chat_id),
+                                "phone": expected_phone,
+                                "code": code,
+                                "token": payload,
+                                "expires_at": tok.get("expires_at") or iso(now() + timedelta(minutes=5)),
+                                "created_at": iso(),
+                                "used": False,
+                            }},
+                            upsert=True,
+                        )
 
-            # Token ishlamasa ham — chat allaqachon ulangan bo'lsa
-            if not phone:
-                phone = await find_phone_by_chat_id(chat_id)
+            # Allaqachon SHU raqam bilan ulangan bo'lsa — kod yuborish mumkin
+            linked_phone = await find_phone_by_chat_id(chat_id)
+            if linked_phone and expected_phone and await phones_equal(linked_phone, expected_phone):
+                if not code:
+                    otp = await find_latest_otp(linked_phone)
+                    code = (otp or {}).get("code") or ""
+                if code:
+                    await deliver_otp_code(chat_id, code)
+                    return {"ok": True}
 
-            if phone and not code:
-                otp = await find_latest_otp(phone)
-                if otp:
-                    code = otp.get("code")
-
-            if phone and code:
-                await deliver_otp_code(chat_id, code)
-                return {"ok": True}
-
-            if phone:
-                await telegram_send_message(
-                    chat_id,
-                    f"✅ Raqamingiz ulangan: <b>{phone}</b>\n\n"
-                    f"Ilovada <b>«Kod olish»</b> ni bosing — kod shu chatga keladi.",
-                )
-                return {"ok": True}
-
-            await telegram_send_message(
-                chat_id,
-                "Assalomu alaykum! <b>ZarraMarket</b>\n\n"
-                "1️⃣ Ilovada telefon → <b>Kod olish</b>\n"
-                "2️⃣ Yoki pastdan <b>telefon raqamni ulash</b>",
-                reply_markup=kb_contact,
-            )
-            return {"ok": True}
-
-        if text:
-            phone = await find_phone_by_chat_id(chat_id)
-            if phone:
-                otp = await find_latest_otp(phone)
+            if linked_phone and not expected_phone:
+                # Oddiy /start — faqat o'z ulangan raqami uchun oxirgi OTP
+                otp = await find_latest_otp(linked_phone)
                 if otp and otp.get("code"):
                     await deliver_otp_code(chat_id, otp["code"])
                     return {"ok": True}
+                await telegram_send_message(
+                    chat_id,
+                    f"✅ Ulangan raqam: <b>{linked_phone}</b>\n\n"
+                    f"Ilovada <b>shu raqam</b> bilan «Kod olish» ni bosing.",
+                )
+                return {"ok": True}
+
+            # Yangi yoki boshqa raqam — majburiy kontakt
+            msg = (
+                "Tasdiqlash uchun <b>o'z telefon raqamingizni ulashing</b>.\n\n"
+                "Ilovada yozgan raqam bilan Telegram raqami <b>bir xil</b> bo'lishi kerak."
+            )
+            if expected_phone:
+                msg = (
+                    f"Ilovada kiritilgan: <b>{expected_phone}</b>\n\n"
+                    f"Pastdagi tugma orqali <b>shu raqamli</b> Telegram kontaktini ulashing.\n"
+                    f"Boshqa raqam bo'lsa kod <b>yuborilmaydi</b>."
+                )
+            await telegram_send_message(chat_id, msg, reply_markup=kb_contact)
+            return {"ok": True}
+
+        if text:
             await telegram_send_message(
                 chat_id,
-                "Kod olish uchun ilovada «Kod olish» ni bosing yoki /start yozing.",
+                "Kod uchun ilovada «Kod olish» → keyin shu yerda raqamni ulash / Start.",
                 reply_markup=kb_contact,
             )
         return {"ok": True}
