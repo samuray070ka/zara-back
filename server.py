@@ -3501,20 +3501,71 @@ async def seller_payment_received(oid: str, user=Depends(get_seller)):
 async def seller_stats(user=Depends(get_seller)):
     try:
         day_start = (now() - timedelta(hours=36)).isoformat()
+        proj = {
+            "_id": 0, "id": 1, "number": 1, "status": 1, "created_at": 1,
+            "seller_subtotal": 1, "earn_total": 1, "subtotal": 1, "total": 1,
+            "returned_items_count": 1, "status_history": 1,
+            "seller_payment_received_at": 1, "seller_payment_confirmed": 1,
+            "items.qty": 1, "items.delivery_status": 1, "items.price": 1,
+            "items.base_price": 1, "items.earn": 1, "items.seller_price": 1,
+            "items.extra_seller_price": 1,
+        }
         orders = await (
             db.orders.find(
                 {"seller_id": user["id"], "created_at": {"$gte": day_start}},
-                {"_id": 0, "id": 1, "number": 1, "status": 1, "created_at": 1,
-                 "seller_subtotal": 1, "earn_total": 1, "subtotal": 1, "total": 1,
-                 "returned_items_count": 1, "status_history": 1,
-                 "items.qty": 1, "items.delivery_status": 1, "items.price": 1,
-                 "items.base_price": 1, "items.earn": 1, "items.seller_price": 1},
+                proj,
             )
             .max_time_ms(8000)
             .to_list(300)
         )
         snap = seller_today_snapshot(user, orders)
-        # Top products without images
+
+        # Yetkazilgan, lekin hali «Pulni oldim» bosilmagan buyurtmalar — olish kerak
+        unpaid = await (
+            db.orders.find(
+                {
+                    "seller_id": user["id"],
+                    "status": "delivered",
+                    "$or": [
+                        {"seller_payment_received_at": {"$exists": False}},
+                        {"seller_payment_received_at": None},
+                    ],
+                },
+                proj,
+            )
+            .max_time_ms(10000)
+            .to_list(500)
+        )
+        # confirmed=True lekin received_at yo'q bo'lsa ham olingan deb hisobla
+        unpaid = [
+            o for o in unpaid
+            if not o.get("seller_payment_received_at") and not o.get("seller_payment_confirmed")
+        ]
+        to_collect = sum(order_seller_amount(o) for o in unpaid)
+        to_collect_count = len(unpaid)
+
+        today = local_day_key()
+        collected_today_orders = await (
+            db.orders.find(
+                {
+                    "seller_id": user["id"],
+                    "status": "delivered",
+                    "seller_payment_received_at": {"$gte": today},
+                },
+                proj,
+            )
+            .max_time_ms(8000)
+            .to_list(300)
+        )
+        # filter by local day of payment
+        collected_today_amt = 0.0
+        collected_today_n = 0
+        for o in collected_today_orders:
+            paid_at = o.get("seller_payment_received_at") or ""
+            if local_day_key(paid_at) == today:
+                collected_today_amt += order_seller_amount(o)
+                collected_today_n += 1
+
         prods = await (
             db.products.find(
                 {"seller_id": user["id"]},
@@ -3530,6 +3581,10 @@ async def seller_stats(user=Depends(get_seller)):
             "today_returns_count": snap["today_returns_count"],
             "today_returns_amount": snap["today_returns_amount"],
             "stats_reset_at": snap.get("stats_reset_at"),
+            "to_collect": round(to_collect),
+            "to_collect_count": to_collect_count,
+            "collected_today": round(collected_today_amt),
+            "collected_today_count": collected_today_n,
             "top_products": [
                 {"name": ((p.get("name") or {}) if isinstance(p.get("name"), dict) else {}).get("uz") or "?",
                  "sold": p.get("sold", 0), "views": p.get("views", 0)}
@@ -3541,7 +3596,9 @@ async def seller_stats(user=Depends(get_seller)):
         logger.exception("seller_stats failed: %s", e)
         return {
             "today_orders": 0, "today_sales": 0, "today_returns_count": 0,
-            "today_returns_amount": 0, "top_products": [], "today_orders_list": [],
+            "today_returns_amount": 0, "to_collect": 0, "to_collect_count": 0,
+            "collected_today": 0, "collected_today_count": 0,
+            "top_products": [], "today_orders_list": [],
         }
 
 
