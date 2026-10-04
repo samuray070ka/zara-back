@@ -2623,9 +2623,11 @@ def returned_item_amount(order: dict) -> float:
 
 
 def seller_today_snapshot(user: dict, orders: Optional[List[dict]] = None):
+    """Statistika: faqat stats_reset_at dan keyin (kunlik avto-nol yo'q).
+    0 — admin «Statistikani 0 qilish» bosilganda.
+    """
     si = user.get("seller_info", {}) or {}
     orders = orders if orders is not None else []
-    today = local_day_key()
     reset_at = parse_iso_dt(si.get("stats_reset_at"))
 
     def after_reset(ts: Optional[str]) -> bool:
@@ -2638,13 +2640,10 @@ def seller_today_snapshot(user: dict, orders: Optional[List[dict]] = None):
     for o in orders:
         if not o:
             continue
-        # bekor / to'liq rad etilganlarni aylanmaga kiritmaymiz
         st = o.get("status") or ""
         if st in ("cancelled", "seller_rejected"):
             continue
         created_ts = o.get("created_at") or status_at(o, "new") or ""
-        if local_day_key(created_ts) != today:
-            continue
         if not after_reset(created_ts):
             continue
         todays.append(o)
@@ -3500,7 +3499,7 @@ async def seller_payment_received(oid: str, user=Depends(get_seller)):
 @api_router.get("/seller/stats")
 async def seller_stats(user=Depends(get_seller)):
     try:
-        day_start = (now() - timedelta(hours=36)).isoformat()
+        day_start = (now() - timedelta(days=120)).isoformat()
         proj = {
             "_id": 0, "id": 1, "number": 1, "status": 1, "created_at": 1,
             "seller_subtotal": 1, "earn_total": 1, "subtotal": 1, "total": 1,
@@ -3515,8 +3514,8 @@ async def seller_stats(user=Depends(get_seller)):
                 {"seller_id": user["id"], "created_at": {"$gte": day_start}},
                 proj,
             )
-            .max_time_ms(8000)
-            .to_list(300)
+            .max_time_ms(12000)
+            .to_list(800)
         )
         snap = seller_today_snapshot(user, orders)
 
@@ -4321,8 +4320,8 @@ async def admin_users(role: Optional[str] = None, q: Optional[str] = None, user=
             ids = [u["id"] for u in users if u.get("id")]
             if not ids:
                 return []
-            # UTC+5 kuni — 2 kunlik oyna (UTC siljishiga barqaror)
-            day_start = (now() - timedelta(hours=36)).isoformat()
+            # Resetdan beri yig'iladi — kunlik avto-nol yo'q
+            day_start = (now() - timedelta(days=120)).isoformat()
             all_orders = await (
                 db.orders.find(
                     {"seller_id": {"$in": ids}, "created_at": {"$gte": day_start}},
