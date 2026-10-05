@@ -4322,33 +4322,62 @@ async def admin_users(role: Optional[str] = None, q: Optional[str] = None, user=
                 return []
             # Resetdan beri yig'iladi — kunlik avto-nol yo'q
             day_start = (now() - timedelta(days=120)).isoformat()
+            order_proj = {
+                "_id": 0, "id": 1, "number": 1, "seller_id": 1, "status": 1, "total": 1,
+                "subtotal": 1, "seller_subtotal": 1, "earn_total": 1, "created_at": 1,
+                "client_name": 1, "returned_items_count": 1, "status_history": 1,
+                "seller_payment_received_at": 1, "seller_payment_confirmed": 1,
+                "items.product_id": 1, "items.name": 1, "items.qty": 1, "items.price": 1,
+                "items.base_price": 1, "items.earn": 1, "items.seller_price": 1,
+                "items.delivery_status": 1, "items.extra_seller_price": 1,
+            }
             all_orders = await (
                 db.orders.find(
                     {"seller_id": {"$in": ids}, "created_at": {"$gte": day_start}},
-                    {"_id": 0, "id": 1, "number": 1, "seller_id": 1, "status": 1, "total": 1,
-                     "subtotal": 1, "seller_subtotal": 1, "earn_total": 1, "created_at": 1,
-                     "client_name": 1, "returned_items_count": 1, "status_history": 1,
-                     "items.product_id": 1, "items.name": 1, "items.qty": 1, "items.price": 1,
-                     "items.base_price": 1, "items.earn": 1, "items.seller_price": 1,
-                     "items.delivery_status": 1},
+                    order_proj,
                 )
                 .max_time_ms(12000)
                 .to_list(1000)
             )
+            # Yetkazilgan + pul olinmagan (Pulni oldim bosilmagan) — admin "berilishi kerak"
+            unpaid_orders = await (
+                db.orders.find(
+                    {
+                        "seller_id": {"$in": ids},
+                        "status": "delivered",
+                        "$or": [
+                            {"seller_payment_received_at": {"$exists": False}},
+                            {"seller_payment_received_at": None},
+                        ],
+                    },
+                    order_proj,
+                )
+                .max_time_ms(12000)
+                .to_list(800)
+            )
             by_seller: Dict[str, List[dict]] = {}
             for o in all_orders:
                 by_seller.setdefault(o.get("seller_id") or "", []).append(o)
+            unpaid_by: Dict[str, List[dict]] = {}
+            for o in unpaid_orders:
+                if o.get("seller_payment_confirmed"):
+                    continue
+                unpaid_by.setdefault(o.get("seller_id") or "", []).append(o)
             result = []
             for seller_user in users:
                 orders = by_seller.get(seller_user["id"], [])
                 snap = dict(seller_user)
                 today_stats = seller_today_snapshot(seller_user, orders)
+                unpaid = unpaid_by.get(seller_user["id"], [])
+                to_collect = sum(order_seller_amount(o) for o in unpaid)
                 snap["seller_today_summary"] = {
                     "today_orders": today_stats["today_orders"],
                     "today_amount": today_stats["today_amount"],
                     "today_returns_count": today_stats["today_returns_count"],
                     "today_returns_amount": today_stats["today_returns_amount"],
                     "stats_reset_at": today_stats.get("stats_reset_at"),
+                    "to_collect": round(to_collect),
+                    "to_collect_count": len(unpaid),
                 }
                 snap["seller_today_orders"] = today_stats.get("today_orders_list") or []
                 result.append(json_safe(snap))
