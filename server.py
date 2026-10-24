@@ -1325,10 +1325,32 @@ async def list_products(
     if in_stock:
         q["stock"] = {"$gt": 0}
     if search:
-        rx = {"$regex": re.escape(search), "$options": "i"}
-        q["$and"] = [{"$or": [{"name.uz": rx}, {"name.ru": rx}, {"name.en": rx}, {"desc.uz": rx}]}]
-        # non-blocking log — never slow down search response
-        asyncio.create_task(db.search_log.insert_one({"id": uid(), "q": search, "at": iso()}))
+        raw_q = (search or "").strip()
+        # har bir so'z alohida (AND), butun ibora ham (OR ichida)
+        tokens = [t for t in re.split(r"\s+", raw_q) if t]
+        or_fields = []
+        phrases = [raw_q] + tokens
+        seen = set()
+        for ph in phrases:
+            key = ph.lower()
+            if key in seen or len(ph) < 1:
+                continue
+            seen.add(key)
+            rx = {"$regex": re.escape(ph), "$options": "i"}
+            or_fields.extend([
+                {"name.uz": rx}, {"name.ru": rx}, {"name.en": rx},
+                {"name": rx},  # name string bo'lsa
+                {"desc.uz": rx}, {"desc.ru": rx}, {"desc.en": rx},
+                {"search_text": rx},
+                {"brand": rx},
+                {"tags": rx},
+            ])
+        if or_fields:
+            q.setdefault("$and", []).append({"$or": or_fields})
+        try:
+            asyncio.create_task(db.search_log.insert_one({"id": uid(), "q": raw_q, "at": iso()}))
+        except Exception:
+            pass
     sort_map = {"cheap": [("price", 1)], "expensive": [("price", -1)], "new": [("created_at", -1)],
                 "popular": [("sold", -1)], "rating": [("rating", -1)], "mix": [("pinned", -1), ("sold", -1)]}
     cursor = db.products.find(q).sort(sort_map.get(sort, sort_map["mix"])).skip(skip).limit(limit)
@@ -1485,8 +1507,23 @@ async def suggest(q: str = ""):
         pop = await db.search_log.aggregate([{"$group": {"_id": "$q", "c": {"$sum": 1}}}, {"$sort": {"c": -1}}, {"$limit": 8}]).to_list(8)
         return {"suggestions": [p["_id"] for p in pop]}
     rx = {"$regex": re.escape(q), "$options": "i"}
-    prods = await db.products.find({**PRODUCT_FILTER, "$or": [{"name.uz": rx}, {"name.ru": rx}, {"name.en": rx}]}, {"_id": 0, "name": 1}).limit(6).to_list(6)
-    return {"suggestions": list({(p.get("name") or {}).get("uz") or "" for p in prods if (p.get("name") or {}).get("uz")})}
+    prods = await db.products.find(
+        {**PRODUCT_FILTER, "$or": [
+            {"name.uz": rx}, {"name.ru": rx}, {"name.en": rx},
+            {"name": rx}, {"search_text": rx}, {"brand": rx},
+        ]},
+        {"_id": 0, "name": 1},
+    ).limit(8).to_list(8)
+    out = []
+    for p in prods:
+        n = p.get("name")
+        if isinstance(n, dict):
+            label = n.get("uz") or n.get("ru") or n.get("en") or ""
+        else:
+            label = str(n or "")
+        if label and label not in out:
+            out.append(label)
+    return {"suggestions": out}
 
 """
 Rasm orqali qidiruv — backend qo'shimchasi
@@ -4501,17 +4538,15 @@ async def admin_reject_seller(target_id: str, user=Depends(get_admin)):
 async def admin_products(
     status: Optional[str] = None,
     skip: int = Query(0, ge=0),
-    limit: int = Query(100, ge=1, le=300),
+    limit: int = Query(200, ge=1, le=500),
     user=Depends(get_admin),
 ):
-    """Fast admin product list — aggregation projects tiny fields BEFORE sort
-    so Atlas free-tier does not hit QueryExceededMemoryLimitNoDiskUseAllowed.
-    """
+    """Admin mahsulotlar — rasm, sotuvchi, vaqt; skip/limit bilan hammasi."""
     try:
         match: Dict[str, Any] = {}
         if status and status.strip():
             match["status"] = status.strip()
-        lim = min(int(limit or 100), 100)
+        lim = min(int(limit or 200), 500)
         sk = max(int(skip or 0), 0)
         pipeline = [
             {"$match": match} if match else {"$match": {}},
@@ -4533,12 +4568,29 @@ async def admin_products(
                 "reviews_count": 1,
                 "created_at": 1,
                 "markup_percent": 1,
+                "images": {"$slice": [{"$ifNull": ["$images", []]}, 1]},
+                "image": 1,
+                "preview_image": 1,
             }},
             {"$sort": {"created_at": -1}},
             {"$skip": sk},
             {"$limit": lim},
         ]
-        raw = await db.products.aggregate(pipeline, maxTimeMS=15000, allowDiskUse=True).to_list(lim)
+        raw = await db.products.aggregate(pipeline, maxTimeMS=20000, allowDiskUse=True).to_list(lim)
+        seller_ids = list({str(p.get("seller_id") or "") for p in raw if p.get("seller_id")})
+        sellers_map: Dict[str, dict] = {}
+        if seller_ids:
+            susers = await db.users.find(
+                {"id": {"$in": seller_ids}},
+                {"_id": 0, "id": 1, "phone": 1, "first_name": 1, "last_name": 1, "seller_info.shop_name": 1},
+            ).to_list(len(seller_ids) + 5)
+            for u in susers:
+                si = u.get("seller_info") or {}
+                sellers_map[str(u.get("id"))] = {
+                    "shop_name": si.get("shop_name") or "",
+                    "phone": u.get("phone") or "",
+                    "name": f"{u.get('first_name') or ''} {u.get('last_name') or ''}".strip(),
+                }
         out = []
         for p in raw:
             try:
@@ -4548,6 +4600,16 @@ async def admin_products(
                 price = float(p.get("price") or 0)
                 markup = float(p.get("markup_percent") or SETTINGS_CACHE.get("default_markup_percent") or 0)
                 display = round(price * (1 + markup / 100)) if markup else price
+                imgs = p.get("images") if isinstance(p.get("images"), list) else []
+                first = ""
+                if imgs:
+                    first = str(imgs[0] or "")
+                if not first and isinstance(p.get("image"), str):
+                    first = p["image"]
+                if not first and isinstance(p.get("preview_image"), str):
+                    first = p["preview_image"]
+                sid = str(p.get("seller_id") or "")
+                sinfo = sellers_map.get(sid) or {}
                 out.append({
                     "id": p.get("id"),
                     "name": {
@@ -4555,7 +4617,9 @@ async def admin_products(
                         "ru": str(name.get("ru") or ""),
                         "en": str(name.get("en") or ""),
                     },
-                    "images": [],
+                    "images": [first] if first else [],
+                    "image": first or None,
+                    "preview_image": first or None,
                     "price": price,
                     "old_price": p.get("old_price"),
                     "display_price": display,
@@ -4566,6 +4630,9 @@ async def admin_products(
                     "pinned": bool(p.get("pinned")),
                     "hidden": bool(p.get("hidden")),
                     "seller_id": p.get("seller_id"),
+                    "seller_shop": sinfo.get("shop_name") or "",
+                    "seller_phone": sinfo.get("phone") or "",
+                    "seller_name": sinfo.get("name") or "",
                     "category_id": p.get("category_id"),
                     "rating": p.get("rating") or 0,
                     "reviews_count": p.get("reviews_count") or 0,
