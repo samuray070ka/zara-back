@@ -1193,46 +1193,27 @@ PRODUCT_FILTER = {"status": "approved", "hidden": {"$ne": True}}
 
 
 def _list_thumb(img_str: str, max_side: int = 240, quality: int = 55) -> str:
-    """List/card uchun kichik JPEG thumbnail. Xato bo'lsa original yoki bo'sh."""
+    """List/card uchun rasm. Og'ir PIL siqish YO'Q — 500/timeout oldini oladi."""
     try:
         if not img_str or not isinstance(img_str, str):
             return ""
         s = img_str.strip()
         if not s:
             return ""
+        # CDN / HTTP — to'g'ridan
         if s.startswith("http://") or s.startswith("https://"):
             return s
-        if s.startswith("data:") and len(s) < 12_000:
+        # data URI — faqat kichiklarini qaytaramiz (PIL ishlamaydi, xotira/CPU tejaymiz)
+        if s.startswith("data:"):
+            if len(s) <= 80_000:
+                return s
+            return ""
+        # boshqa string (path/key)
+        if len(s) < 12_000:
             return s
-        if not s.startswith("data:"):
-            return s if len(s) < 12_000 else ""
-        import base64 as _b64
-        import io as _io
-        from PIL import Image as _PILImage
-        parts = s.split(",", 1)
-        b64part = parts[1] if len(parts) == 2 else s
-        try:
-            raw = _b64.b64decode(b64part)
-        except Exception:
-            return ""
-        im = _PILImage.open(_io.BytesIO(raw))
-        if im.mode != "RGB":
-            im = im.convert("RGB")
-        # Pillow 9 vs 10 compatibility
-        try:
-            resample = _PILImage.Resampling.LANCZOS
-        except AttributeError:
-            resample = getattr(_PILImage, "LANCZOS", _PILImage.BICUBIC)
-        im.thumbnail((max_side, max_side), resample)
-        buf = _io.BytesIO()
-        im.save(buf, format="JPEG", quality=quality, optimize=True)
-        out_b64 = _b64.b64encode(buf.getvalue()).decode("ascii")
-        return "data:image/jpeg;base64," + out_b64
+        return ""
     except Exception:
-        try:
-            return s if len(s) < 40_000 else ""
-        except Exception:
-            return ""
+        return ""
 
 
 def product_list_out(p):
@@ -1298,6 +1279,25 @@ async def list_products(
     min_rating: Optional[float] = None, in_stock: Optional[bool] = None,
     sort: Optional[str] = "mix", skip: int = 0, limit: int = Query(20, le=50),
 ):
+    """Public product list — hech qachon 500 bermasligi kerak."""
+    try:
+        return await _list_products_impl(
+            search=search, category_id=category_id, seller_id=seller_id,
+            min_price=min_price, max_price=max_price, discount=discount,
+            min_rating=min_rating, in_stock=in_stock, sort=sort, skip=skip, limit=limit,
+        )
+    except Exception as e:
+        logger.exception("list_products failed: %s", e)
+        return {"items": [], "total": 0, "error": str(e)[:200]}
+
+
+async def _list_products_impl(
+    search: Optional[str] = None, category_id: Optional[str] = None,
+    seller_id: Optional[str] = None, min_price: Optional[float] = None,
+    max_price: Optional[float] = None, discount: Optional[bool] = None,
+    min_rating: Optional[float] = None, in_stock: Optional[bool] = None,
+    sort: Optional[str] = "mix", skip: int = 0, limit: int = 20,
+):
     cache_key = None
     try:
         if not search and not seller_id and min_price is None and max_price is None and not discount and min_rating is None and not in_stock:
@@ -1351,11 +1351,35 @@ async def list_products(
             asyncio.create_task(db.search_log.insert_one({"id": uid(), "q": raw_q, "at": iso()}))
         except Exception:
             pass
-    sort_map = {"cheap": [("price", 1)], "expensive": [("price", -1)], "new": [("created_at", -1)],
-                "popular": [("sold", -1)], "rating": [("rating", -1)], "mix": [("pinned", -1), ("sold", -1)]}
-    cursor = db.products.find(q).sort(sort_map.get(sort, sort_map["mix"])).skip(skip).limit(limit)
-    raw_items = await cursor.to_list(limit)
-    items = [product_list_out(p) for p in raw_items if p]
+    sort_map = {
+        "cheap": [("price", 1)],
+        "expensive": [("price", -1)],
+        "new": [("created_at", -1)],
+        "popular": [("sold", -1)],
+        "rating": [("rating", -1)],
+        "mix": [("pinned", -1), ("sold", -1), ("created_at", -1)],
+    }
+    sort_spec = sort_map.get(sort or "mix", sort_map["mix"])
+    raw_items = []
+    try:
+        cursor = db.products.find(q).sort(sort_spec).skip(int(skip or 0)).limit(int(limit or 20))
+        raw_items = await cursor.to_list(int(limit or 20))
+    except Exception as e:
+        logger.warning("products sort failed (%s), fallback created_at: %s", sort, e)
+        try:
+            cursor = db.products.find(q).sort([("created_at", -1)]).skip(int(skip or 0)).limit(int(limit or 20))
+            raw_items = await cursor.to_list(int(limit or 20))
+        except Exception as e2:
+            logger.exception("products fallback find failed: %s", e2)
+            raw_items = []
+    items = []
+    for p in raw_items:
+        if not p:
+            continue
+        try:
+            items.append(product_list_out(p))
+        except Exception as e:
+            logger.warning("product_list_out skip: %s", e)
     # category-name fallback: "telefon" matches category "Telefonlar"
     if search and not items and not skip:
         rx = {"$regex": re.escape(search), "$options": "i"}
@@ -1881,14 +1905,16 @@ async def search_by_image(image: UploadFile = File(...)):
     if to_persist:
         asyncio.create_task(_persist_image_feats(to_persist[:60]))
 
-    # Aniq moslik — eng yuqori prioritet
+    # Faqat BIR XIL / juda yaqin rasm — ommabop fallback YO'Q
+    # dist 0 = bir xil; ~0.04–0.10 yaqin; undan katta = boshqa mahsulot
+    MAX_VISUAL_DIST = 0.085
+
     if exact_hits:
-        # unique by id
         seen = set()
         uniq = []
         for p in exact_hits:
             pid = p.get("id")
-            if pid in seen:
+            if not pid or pid in seen:
                 continue
             seen.add(pid)
             uniq.append(p)
@@ -1899,36 +1925,38 @@ async def search_by_image(image: UploadFile = File(...)):
         }
 
     if scored:
-        # eng yaqin BIRINCHI (dist o'sish tartibida)
         scored.sort(key=lambda x: (x[0], -int((x[1] or {}).get("sold") or 0)))
+        best = float(scored[0][0]) if scored else 1e9
         seen = set()
         top = []
         for dist, p in scored:
-            pid = p.get("id")
+            if float(dist) > MAX_VISUAL_DIST:
+                break  # sortlangan — qolganlar yanada uzoq
+            pid = (p or {}).get("id")
             if not pid or pid in seen:
                 continue
             seen.add(pid)
-            top.append(p)
-            if len(top) >= 24:
+            out = _visual_search_out(p)
+            if isinstance(out, dict):
+                out["match_dist"] = round(float(dist), 4)
+            top.append(out)
+            if len(top) >= 12:
                 break
         return {
-            "items": [_visual_search_out(p) for p in top],
+            "items": top,
             "exact": False,
             "took_ms": int((time.time() - t0) * 1000),
-            "best_dist": round(float(scored[0][0]), 4) if scored else None,
+            "best_dist": round(best, 4),
+            "threshold": MAX_VISUAL_DIST,
         }
 
-    # Fallback — faqat hech narsa score bo'lmasa
-    fallback = precomputed or need_compute or []
-    popular = sorted(
-        fallback,
-        key=lambda x: (-int(x.get("sold") or 0), -float(x.get("rating") or 0)),
-    )[:20]
+    # Hech narsa yaqin emas — bo'sh (ommabop mahsulotlarni bermaymiz)
     return {
-        "items": [_visual_search_out(p) for p in popular],
+        "items": [],
         "exact": False,
-        "fallback": True,
+        "fallback": False,
         "took_ms": int((time.time() - t0) * 1000),
+        "best_dist": None,
     }
 
 
@@ -3005,6 +3033,7 @@ async def seller_search_by_image(image: UploadFile = File(...), user=Depends(get
         except Exception:
             continue
 
+    MAX_VISUAL_DIST = 0.085
     if exact:
         return {
             "items": [_visual_search_out(p) for p in exact[:20]],
@@ -3013,11 +3042,22 @@ async def seller_search_by_image(image: UploadFile = File(...), user=Depends(get
             "took_ms": int((time.time() - t0) * 1000),
         }
     scored.sort(key=lambda x: x[0])
-    top = [p for _, p in scored[:20]]
+    top = []
+    best = float(scored[0][0]) if scored else None
+    for dist, p in scored:
+        if float(dist) > MAX_VISUAL_DIST:
+            break
+        out = _visual_search_out(p)
+        if isinstance(out, dict):
+            out["match_dist"] = round(float(dist), 4)
+        top.append(out)
+        if len(top) >= 12:
+            break
     return {
-        "items": [_visual_search_out(p) for p in top],
+        "items": top,
         "exact": False,
         "scope": "seller",
+        "best_dist": round(best, 4) if best is not None else None,
         "took_ms": int((time.time() - t0) * 1000),
     }
 
@@ -4249,16 +4289,37 @@ async def admin_low_stock_products(user=Depends(get_admin)):
 
 @api_router.get("/admin/dashboard/history")
 async def admin_dashboard_history(metric: str, user=Depends(get_admin)):
-    today = iso()[:10]
+    try:
+        return await _admin_dashboard_history_impl(metric)
+    except Exception as e:
+        logger.exception("admin_dashboard_history: %s", e)
+        return {"metric": metric, "title": metric, "items": []}
+
+
+async def _admin_dashboard_history_impl(metric: str):
+    today = local_day_key()
     settings = await db.settings.find_one({"id": "main"}, {"_id": 0}) or {}
     cutoff = admin_dashboard_cutoff(settings)
-    orders = await db.orders.find({}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    order_proj = {
+        "_id": 0, "id": 1, "number": 1, "status": 1, "total": 1, "subtotal": 1,
+        "created_at": 1, "client_name": 1, "client_phone": 1,
+        "items.product_id": 1, "items.qty": 1, "items.price": 1, "items.base_price": 1,
+        "items.delivery_status": 1,
+    }
+    orders = await db.orders.find({}, order_proj).sort("created_at", -1).max_time_ms(12000).to_list(2000)
     money_orders = orders
     if cutoff is not None:
         money_orders = [o for o in orders if parse_iso_dt(o.get("created_at")) and parse_iso_dt(o.get("created_at")) >= cutoff]
-    users = await db.users.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
-    products = await db.products.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
-    product_costs = {p["id"]: float(p.get("cost_price") or 0) for p in products}
+    users = await db.users.find(
+        {},
+        {"_id": 0, "id": 1, "phone": 1, "first_name": 1, "last_name": 1, "role": 1,
+         "created_at": 1, "seller_info": 1, "courier_info": 1},
+    ).sort("created_at", -1).max_time_ms(10000).to_list(1000)
+    products = await db.products.find(
+        {},
+        {"_id": 0, "id": 1, "cost_price": 1, "name": 1, "status": 1, "stock": 1, "price": 1, "created_at": 1, "seller_id": 1},
+    ).sort("created_at", -1).max_time_ms(10000).to_list(1000)
+    product_costs = {p["id"]: float(p.get("cost_price") or 0) for p in products if p.get("id")}
 
     def order_profit(order: dict) -> float:
         total = 0.0
@@ -5362,9 +5423,9 @@ async def seed():
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    global REMINDER_TASK
+    global REMINDER_TASK 
     if REMINDER_TASK and not REMINDER_TASK.done():
-        REMINDER_TASK.cancel()
+        REMINDER_TASK.cancel() 
         try:
             await REMINDER_TASK
         except asyncio.CancelledError:
