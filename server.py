@@ -3063,59 +3063,57 @@ async def seller_search_by_image(image: UploadFile = File(...), user=Depends(get
 
 
 @api_router.get("/seller/products")
-async def seller_products(user=Depends(get_seller)):
-    """Seller product list — birinchi rasmni ham qaytaramiz (card preview)."""
+async def seller_products(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(30, ge=1, le=100),
+    user=Depends(get_seller),
+):
+    """Sotuvchi mahsulotlari — sahifalab, yengil. Xatoni yashirmaydi."""
+    light = {
+        "_id": 0,
+        "id": 1, "name": 1, "price": 1, "old_price": 1, "cost_price": 1,
+        "box_price": 1, "units_per_box": 1, "unit_type": 1, "stock": 1, "status": 1,
+        "hidden": 1, "pinned": 1, "sold": 1, "views": 1, "rating": 1,
+        "category_id": 1, "created_at": 1, "seller_id": 1, "markup_percent": 1,
+        "image": 1, "preview_image": 1,
+    }
+    flt = {"seller_id": user["id"]}
+
+    async def _fetch(projection):
+        return await (
+            db.products.find(flt, projection)
+            .sort("created_at", -1)
+            .skip(skip)
+            .limit(limit)
+            .max_time_ms(25000)
+            .to_list(limit)
+        )
+
     try:
-        pipeline = [
-            {"$match": {"seller_id": user["id"]}},
-            {"$project": {
-                "_id": 0,
-                "id": 1, "name": 1, "price": 1, "old_price": 1, "cost_price": 1,
-                "box_price": 1, "units_per_box": 1, "unit_type": 1, "stock": 1, "status": 1,
-                "hidden": 1, "pinned": 1, "sold": 1, "views": 1, "rating": 1,
-                "category_id": 1, "created_at": 1, "seller_id": 1,
-                "markup_percent": 1,
-                # faqat birinchi rasm — card uchun yetarli, xotira tejaydi
-                "images": {"$slice": [{"$ifNull": ["$images", []]}, 1]},
-                "image": 1,
-                "preview_image": 1,
-            }},
-            {"$sort": {"created_at": -1}},
-            {"$limit": 100},
-        ]
-        raw = await db.products.aggregate(pipeline, maxTimeMS=12000, allowDiskUse=True).to_list(150)
-        out = []
-        for p in raw:
-            try:
-                p = dict(p)
-                p.setdefault("images", [])
-                p.setdefault("desc", {"uz": "", "ru": "", "en": ""})
-                out.append(product_list_out(p))
-            except Exception as e:
-                logger.exception("seller product row failed: %s", e)
-                # fallback: try keep first image if present on raw doc
-                imgs = p.get("images") if isinstance(p.get("images"), list) else []
-                first = ""
-                if imgs:
-                    first = str(imgs[0] or "")
-                elif isinstance(p.get("image"), str):
-                    first = p["image"]
-                out.append(json_safe({
-                    "id": p.get("id"),
-                    "name": p.get("name") if isinstance(p.get("name"), dict) else {"uz": str(p.get("name") or ""), "ru": "", "en": ""},
-                    "images": [first] if first else [],
-                    "image": first or None,
-                    "preview_image": first or None,
-                    "price": p.get("price") or 0,
-                    "status": p.get("status") or "pending",
-                    "stock": p.get("stock") or 0,
-                }))
-        return out
+        try:
+            raw = await _fetch({**light, "images": {"$slice": 1}})
+        except Exception as e1:
+            logger.warning("seller_products slice projection failed: %s", e1)
+            raw = await _fetch(light)
     except Exception as e:
         logger.exception("seller_products failed: %s", e)
-        return []
+        raise HTTPException(500, f"Mahsulotlarni olishda xato: {type(e).__name__}: {e}")
 
-
+    out = []
+    for p in raw:
+        try:
+            p = dict(p)
+            p.setdefault("images", [])
+            out.append(product_list_out(p))
+        except Exception as e:
+            logger.exception("seller product row failed: %s", e)
+            out.append(json_safe({
+                "id": p.get("id"),
+                "name": p.get("name") if isinstance(p.get("name"), dict) else {"uz": str(p.get("name") or ""), "ru": "", "en": ""},
+                "images": [], "price": p.get("price") or 0,
+                "status": p.get("status") or "pending", "stock": p.get("stock") or 0,
+            }))
+    return out
 @api_router.post("/seller/products")
 async def seller_add_product(req: ProductReq, user=Depends(get_seller)):
     p = {
